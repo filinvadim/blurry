@@ -14,6 +14,7 @@ import (
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/host/peerstore/pstoremem"
@@ -188,34 +189,69 @@ func (n *Node) Host() host.Host {
 	return n.host
 }
 
-// ConnectCluster dials every configured cluster peer once. The host's
-// ConnManager is responsible for keeping the connections alive afterwards.
-// Errors per peer are logged and not returned individually.
+// connectBackoffMin/Max bound the per-peer retry interval used by
+// ConnectCluster's reconnect loop.
+const (
+	connectBackoffMin = 500 * time.Millisecond
+	connectBackoffMax = time.Minute
+)
+
+// ConnectCluster dials every configured cluster peer in the background.
+// Each peer gets its own goroutine that keeps retrying with exponential
+// backoff until either:
+//   - the connection succeeds, or
+//   - the parent context is cancelled (shutdown).
+//
+// This handles the common boot race where one replica starts before
+// the others are ready, plus transient network glitches at runtime.
+// libp2p's ConnManager keeps the connection alive once established.
 func (n *Node) ConnectCluster(ctx context.Context) error {
 	if n == nil || n.host == nil {
 		return errors.New("node: not started")
 	}
 	ownID := n.host.ID()
-	var firstErr error
-	connected := 0
 	for _, info := range n.clusterInfos {
-		if info.ID == ownID {
+		if info.ID == ownID || info.ID == "" {
 			continue
 		}
-		dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		err := n.host.Connect(dialCtx, info)
-		cancel()
-		if err != nil {
-			nodeLog.Warnf("node: connect %s: %v", info.String(), err)
-			if firstErr == nil {
-				firstErr = err
+		go n.keepConnecting(ctx, info)
+	}
+	return nil
+}
+
+// keepConnecting dials one peer with exponential backoff. It returns
+// when the connection is established (and remains so) or ctx is done.
+func (n *Node) keepConnecting(ctx context.Context, info peer.AddrInfo) {
+	backoff := connectBackoffMin
+	for ctx.Err() == nil {
+		// Skip the dial if libp2p already has a live connection — the
+		// ConnManager keeps it open for us.
+		if n.host.Network().Connectedness(info.ID) == network.Connected {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
 			}
 			continue
 		}
-		connected++
+
+		dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		err := n.host.Connect(dialCtx, info)
+		cancel()
+		if err == nil {
+			nodeLog.Infof("node: connected to cluster peer %s", info.ID.String())
+			backoff = connectBackoffMin
+			continue
+		}
+
+		nodeLog.Debugf("node: connect %s: %v (retry in %s)", info.ID.String(), err, backoff)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		backoff = min(connectBackoffMax, backoff*2)
 	}
-	nodeLog.Infof("node: connected to %d/%d cluster peers", connected, len(n.clusterInfos))
-	return firstErr
 }
 
 // FindProvidersAsync satisfies the bitswap router interface by returning

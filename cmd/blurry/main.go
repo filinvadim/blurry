@@ -171,7 +171,7 @@ func settingsFromViper(v *viper.Viper) (*blurry.Settings, error) {
 		ListenPort:                 v.GetInt("listen_port"),
 		HTTPHost:                   v.GetString("http_host"),
 		HTTPPort:                   v.GetInt("http_port"),
-		ClusterPeers:               v.GetStringSlice("cluster_peers"),
+		ClusterPeers:               splitList(v.GetStringSlice("cluster_peers")),
 		PrivateNetworkPSK:          []byte(v.GetString("private_network_psk")),
 		EnableDHT:                  v.GetBool("enable_dht"),
 		EnableRelay:                v.GetBool("enable_relay"),
@@ -219,6 +219,24 @@ func settingsFromViper(v *viper.Viper) (*blurry.Settings, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// splitList normalises a viper string-slice. Viper does not split
+// comma-separated env values when binding to a StringSlice flag, so an
+// env like BLURRY_CLUSTER_PEERS="a:1,b:2" lands as a single-element
+// slice. This walks every entry and re-splits on commas, trimming
+// whitespace and dropping empties.
+func splitList(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, item := range in {
+		for _, part := range strings.Split(item, ",") {
+			part = strings.TrimSpace(part)
+			if part != "" {
+				out = append(out, part)
+			}
+		}
+	}
+	return out
 }
 
 // run starts a Blurry instance and blocks until SIGINT/SIGTERM.

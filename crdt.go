@@ -108,6 +108,13 @@ func NewCRDT(
 	return store, nil
 }
 
+// Datastore returns the CRDT-wrapped datastore. Writes through this
+// datastore are merged into the local store and broadcast to other
+// replicas via the configured Broadcaster.
+func (s *CRDT) Datastore() ds.Datastore {
+	return s.crdt
+}
+
 func (s *CRDT) Close() error {
 	if s == nil {
 		return nil

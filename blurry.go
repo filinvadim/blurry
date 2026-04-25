@@ -86,7 +86,10 @@ func NewBlurry(ctx context.Context, path string, s *Settings) (*Blurry, error) {
 	if src := s.Src(); src != 0 {
 		storeSource = fmt.Sprintf("%x", src)
 	}
-	store := NewStore(dataStore, storeSource)
+	// The Store must write through the CRDT datastore so every Put
+	// becomes a DAG node that gets gossiped to peers. Wiring it to the
+	// raw badger would keep every replica isolated.
+	store := NewStore(crdt.Datastore(), storeSource)
 
 	b := &Blurry{
 		settings: s,

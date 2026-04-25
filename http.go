@@ -164,10 +164,14 @@ func (h *HTTPServer) handleClass(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
 		return
 	}
-	parentID, err := h.b.resolveRef(r.Context(), parent)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+	// _ref is optional on /class; an absent ref means a top-level class.
+	var parentID ID
+	if parent != "" {
+		parentID, err = h.b.resolveRef(r.Context(), parent)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 	id, err := h.b.Store().CreateClass(r.Context(), parentID, name, fields)
 	if err != nil {
