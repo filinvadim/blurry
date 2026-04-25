@@ -94,6 +94,11 @@ type Object struct {
 	Fields  map[string]string `json:"fields"`
 }
 
+// WriteHook is called after a successful Create/Edit on the local
+// Store. Used by ChotkiBridge to forward local changes to a Chotki
+// replica over the chotki wire protocol. May be nil.
+type WriteHook func(ctx context.Context, classID, objectID ID, fields map[string]string)
+
 // Store is the Chotki-compatible class/object/field store.  Keys live
 // directly in badger as "parentID/childID/etc" strings.  ACID semantics
 // come from the underlying CRDT-wrapped badger datastore: writes are
@@ -103,6 +108,37 @@ type Store struct {
 	ds      ds.Datastore
 	source  string // hex peer-id prefix used to mint new ids
 	counter uint64
+
+	hookMu      sync.RWMutex
+	onCreateObj WriteHook
+	onEditObj   WriteHook
+}
+
+// SetWriteHooks installs callbacks that fire after CreateObject /
+// EditObject return successfully. Either may be nil.
+func (s *Store) SetWriteHooks(onCreate, onEdit WriteHook) {
+	s.hookMu.Lock()
+	s.onCreateObj = onCreate
+	s.onEditObj = onEdit
+	s.hookMu.Unlock()
+}
+
+func (s *Store) fireCreate(ctx context.Context, cid, oid ID, fields map[string]string) {
+	s.hookMu.RLock()
+	hook := s.onCreateObj
+	s.hookMu.RUnlock()
+	if hook != nil {
+		hook(ctx, cid, oid, fields)
+	}
+}
+
+func (s *Store) fireEdit(ctx context.Context, cid, oid ID, fields map[string]string) {
+	s.hookMu.RLock()
+	hook := s.onEditObj
+	s.hookMu.RUnlock()
+	if hook != nil {
+		hook(ctx, cid, oid, fields)
+	}
 }
 
 // NewStore wires a Store on top of an existing CRDT-backed datastore.
@@ -202,6 +238,7 @@ func (s *Store) CreateObject(ctx context.Context, classID ID, values map[string]
 			return "", err
 		}
 	}
+	s.fireCreate(ctx, classID, obj.ID, obj.Fields)
 	return obj.ID, nil
 }
 
@@ -233,6 +270,7 @@ func (s *Store) EditObject(ctx context.Context, id ID, values map[string]string)
 	if err := s.putJSON(ctx, dataKey(id), obj); err != nil {
 		return "", err
 	}
+	s.fireEdit(ctx, obj.ClassID, id, values)
 	return id, nil
 }
 

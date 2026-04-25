@@ -119,6 +119,25 @@ type Settings struct {
 	// SyncWrites toggles badger fsync-on-commit. Mirrors chotki's
 	// pebble.WriteOptions{Sync:true} default for ACID durability.
 	SyncWrites bool
+
+	// ---- chotki bridge (PoC) ----------------------------------------
+	//
+	// When ChotkiPeer is non-empty, blurry connects to that chotki TCP
+	// listener using chotki's wire protocol and bidirectionally mirrors
+	// objects of ChotkiMirrorClass between the two stores. See
+	// chotki_bridge.go for limitations.
+
+	// ChotkiPeer is the "host:port" or "tcp://host:port" of a chotki
+	// replica to bridge to. Empty disables the bridge.
+	ChotkiPeer string
+
+	// ChotkiMirrorClass is the local Blurry class name created/used to
+	// mirror chotki objects. Default: "ChotkiMirror".
+	ChotkiMirrorClass string
+
+	// ChotkiClassID is the chotki rdx.ID of the equivalent class on
+	// the chotki side (e.g. "1f-2"). Required when ChotkiPeer is set.
+	ChotkiClassID string
 }
 
 // DefaultSettings returns sensible defaults aligned with chotki's

@@ -28,6 +28,7 @@ type Blurry struct {
 	gossip  *GossipBroadcaster
 	store   *Store
 	httpSrv *HTTPServer
+	bridge  *ChotkiBridge // optional chotki wire-protocol bridge
 }
 
 // NewBlurry creates a Blurry instance configured by Settings, opens the
@@ -112,6 +113,33 @@ func NewBlurry(ctx context.Context, path string, s *Settings) (*Blurry, error) {
 		if err := b.httpSrv.Start(addr); err != nil {
 			blurryLog.Warnf("blurry: http start %s: %v", addr, err)
 		}
+
+	}
+
+	// Optional chotki wire-protocol bridge. Best-effort: a missing peer
+	// is logged, never fatal, so blurry stays usable on its own.
+	if s.ChotkiPeer != "" {
+		mirror := s.ChotkiMirrorClass
+		if mirror == "" {
+			mirror = "ChotkiMirror"
+		}
+		bridge := NewChotkiBridge(store, BridgeOptions{
+			Peer:          s.ChotkiPeer,
+			MirrorClass:   mirror,
+			ChotkiClassID: s.ChotkiClassID,
+			Source:        s.Src(),
+		})
+		if err := bridge.Start(ctx); err != nil {
+			blurryLog.Warnf("blurry: chotki bridge: %v", err)
+		} else {
+			b.bridge = bridge
+			// One hook covers both kinds of writes: local HTTP writes
+			// hit Store.CreateObject which Puts via the CRDT datastore,
+			// and remote merges Put via the CRDT directly. Both fire
+			// the CRDT PutHook. Wiring the Store-level hook in
+			// addition would double-mirror, so we don't.
+			crdt.SetPutHook(bridge.MirrorFromCRDT)
+		}
 	}
 
 	return b, nil
@@ -188,6 +216,11 @@ func (b *Blurry) Close() error {
 		return nil
 	}
 	var firstErr error
+	if b.bridge != nil {
+		if err := b.bridge.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
 	if b.httpSrv != nil {
 		if err := b.httpSrv.Close(); err != nil && firstErr == nil {
 			firstErr = err

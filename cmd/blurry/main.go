@@ -134,6 +134,11 @@ func registerFlags(cmd *cobra.Command) {
 	// TLS for the HTTP server / libp2p TLS transport.
 	f.String("tls_cert_file", "", "TLS certificate file (PEM)")
 	f.String("tls_key_file", "", "TLS private key file (PEM)")
+
+	// Chotki wire-protocol bridge (PoC).
+	f.String("chotki_peer", "", "chotki host:port to bridge to (empty = bridge disabled)")
+	f.String("chotki_mirror_class", "ChotkiMirror", "local Blurry class used to mirror chotki objects")
+	f.String("chotki_class_id", "", "rdx.ID of the corresponding chotki class (e.g. \"1f-2\")")
 }
 
 // initViper wires viper to the cobra flag set, the BLURRY_* env namespace
@@ -201,6 +206,10 @@ func settingsFromViper(v *viper.Viper) (*blurry.Settings, error) {
 		RebroadcastInterval:        v.GetDuration("rebroadcast_interval"),
 		DAGSyncerTimeout:           v.GetDuration("dag_syncer_timeout"),
 		SyncWrites:                 v.GetBool("sync_writes"),
+
+		ChotkiPeer:        v.GetString("chotki_peer"),
+		ChotkiMirrorClass: v.GetString("chotki_mirror_class"),
+		ChotkiClassID:     v.GetString("chotki_class_id"),
 	}
 
 	if cert, key := v.GetString("tls_cert_file"), v.GetString("tls_key_file"); cert != "" || key != "" {

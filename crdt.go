@@ -3,6 +3,7 @@ package blurry
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/ipfs/boxo/bitswap"
@@ -39,6 +40,29 @@ type CRDT struct {
 	broadcaster Broadcaster
 	ctx         context.Context
 	cancel      context.CancelFunc
+
+	hookMu  sync.RWMutex
+	putHook func(k ds.Key, v []byte)
+}
+
+// SetPutHook installs a callback that fires after every datastore Put
+// — including ones merged in from remote replicas. The hook is the
+// only way for higher layers (e.g. the chotki bridge) to learn about
+// CRDT-applied writes that did not originate from this node's HTTP
+// API. Pass nil to clear.
+func (s *CRDT) SetPutHook(hook func(k ds.Key, v []byte)) {
+	s.hookMu.Lock()
+	s.putHook = hook
+	s.hookMu.Unlock()
+}
+
+func (s *CRDT) firePut(k ds.Key, v []byte) {
+	s.hookMu.RLock()
+	hook := s.putHook
+	s.hookMu.RUnlock()
+	if hook != nil {
+		hook(k, v)
+	}
 }
 
 // CRDTSettings carries the subset of Settings the CRDT layer needs.
@@ -111,10 +135,17 @@ func NewCRDT(
 		dagTimeout = time.Minute
 	}
 
+	store := &CRDT{
+		broadcaster: broadcaster,
+		ctx:         ctx,
+		cancel:      cancel,
+	}
+
 	opts := crdt.DefaultOptions()
 	opts.Logger = crdtLog
-	opts.PutHook = func(k ds.Key, _ []byte) {
+	opts.PutHook = func(k ds.Key, v []byte) {
 		crdtLog.Debugf("crdt: item put: %s", k.String())
+		store.firePut(k, v)
 	}
 	opts.DeleteHook = func(k ds.Key) {
 		crdtLog.Debugf("crdt: item deleted: %s", k.String())
@@ -134,13 +165,7 @@ func NewCRDT(
 		cancel()
 		return nil, fmt.Errorf("failed to create CRDT store: %w", err)
 	}
-
-	store := &CRDT{
-		crdt:        crdtStore,
-		broadcaster: broadcaster,
-		ctx:         ctx,
-		cancel:      cancel,
-	}
+	store.crdt = crdtStore
 
 	return store, nil
 }
