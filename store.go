@@ -6,9 +6,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
@@ -18,29 +18,32 @@ import (
 
 var storeLog = logging.Logger("store")
 
-// ID is a Chotki-compatible string identifier for classes, objects and
-// fields. Internally it is just a hex-encoded byte sequence that preserves
-// hierarchical "parent/child/field" composition when joined with '/'.
+// ID is a hierarchical identifier composed of '/'-separated path
+// components.  The string itself IS the badger key after a leading '/'
+// is added.  Composition is direct concatenation:
+//
+//	root              "" (the empty path)
+//	class             "<classID>"                   (one segment)
+//	object            "<classID>/<objectID>"        (two segments)
+//	field             "<classID>/<objectID>/<name>" (three segments)
+//
+// This form satisfies the requirement that the data hierarchy lives in
+// the badger keys themselves ("parentID/childID/etc").
 type ID string
 
 const (
-	// idRoot is the synthetic parent of top-level classes/objects.
-	idRoot ID = "0"
-
-	// keySep separates components in a badger hierarchical key.
 	keySep = "/"
 
-	// keyClassPrefix groups all class definitions under one subtree.
-	keyClassPrefix = "class"
+	// classMarker / objectMarker disambiguate IDs that would otherwise
+	// share the same path depth (e.g. a class definition vs. a top-level
+	// object).  They are part of the ID and therefore part of the key,
+	// preserving the literal "parentID/childID/..." layout.
+	classMarker  = "c"
+	objectMarker = "o"
 
-	// keyObjectPrefix groups all object instances under one subtree.
-	keyObjectPrefix = "object"
-
-	// keyNamePrefix groups Chotki-compatible {name -> id} mappings.
-	keyNamePrefix = "name"
-
-	// keyFieldPrefix is appended after an object id to store fields.
-	keyFieldPrefix = "field"
+	// nameKeyPrefix segregates {name -> id} mappings into their own
+	// subtree so they don't collide with class/object ids.
+	nameKeyPrefix = ".name"
 )
 
 // Errors returned by the Store.
@@ -53,8 +56,7 @@ var (
 	ErrInvalidPayload = errors.New("store: invalid payload")
 )
 
-// FieldKind describes a Chotki-compatible RDT family. The single-byte
-// representation matches Chotki's RDX type codes (F/I/R/S/T/E/L/M/N/Z).
+// FieldKind matches Chotki's RDX type codes (F/I/R/S/T/E/L/M/N/Z).
 type FieldKind byte
 
 const (
@@ -87,58 +89,60 @@ type Class struct {
 // Object is an instance of a Class. Field values are stored as their
 // canonical string form, identical to what the Chotki HTTP API accepts.
 type Object struct {
-	ID     ID                `json:"id"`
-	ClassID ID               `json:"class"`
-	Fields map[string]string `json:"fields"`
+	ID      ID                `json:"id"`
+	ClassID ID                `json:"class"`
+	Fields  map[string]string `json:"fields"`
 }
 
-// Store is the Chotki-compatible CRDT-backed key/value store.
-//
-// All keys use the hierarchical form "<prefix>/<parentID>/<childID>/...",
-// stored in badger via the go-datastore facade. The CRDT layer
-// guarantees causal consistency across replicas.
+// Store is the Chotki-compatible class/object/field store.  Keys live
+// directly in badger as "parentID/childID/etc" strings.  ACID semantics
+// come from the underlying CRDT-wrapped badger datastore: writes are
+// atomic per-key and durable when Settings.SyncWrites is true.
 type Store struct {
 	mu      sync.Mutex
 	ds      ds.Datastore
-	source  string // hex peer-id prefix, used to mint new ids
+	source  string // hex peer-id prefix used to mint new ids
 	counter uint64
 }
 
 // NewStore wires a Store on top of an existing CRDT-backed datastore.
 // The source string is mixed into newly minted ids, keeping them unique
-// per-replica without coordination.
+// per-replica without coordination. A short stable hash of source goes
+// into every id so the same replica produces a consistent prefix.
 func NewStore(d ds.Datastore, source string) *Store {
 	if source == "" {
 		source = "anon"
 	}
-	return &Store{ds: d, source: shortHash(source, 6)}
+	return &Store{ds: d, source: stableHash(source, 8)}
 }
 
-// MintID returns a fresh hierarchical id, prefixed by parent. Ids are
-// monotonically increasing per replica; combined with the source prefix
-// they are globally unique.
-func (s *Store) MintID(parent ID) ID {
+// MintID returns a fresh hierarchical id, using parent as the prefix.
+// The id form is "<parent>/<marker><source>-<counter>" — i.e. a literal
+// "parentID/childID" string that doubles as a badger key.
+func (s *Store) MintID(parent ID, marker string) ID {
 	s.mu.Lock()
 	s.counter++
 	n := s.counter
 	s.mu.Unlock()
+	child := marker + s.source + "-" + strconv.FormatUint(n, 16)
 	if parent == "" {
-		parent = idRoot
+		return ID(child)
 	}
-	return ID(string(parent) + keySep + s.source + "-" + hex.EncodeToString(uint64Bytes(n)))
+	return ID(string(parent) + keySep + child)
 }
 
-// CreateClass defines a new class under parent (use empty/idRoot for top
-// level) with the given fields. Returns the freshly minted class id.
+// CreateClass defines a new class. parent may be empty for top-level
+// classes or another class id for inheritance.  The returned id is the
+// full "parent/child" path.
 func (s *Store) CreateClass(ctx context.Context, parent ID, name string, fields []FieldSpec) (ID, error) {
 	for _, f := range fields {
 		if f.Name == "" || f.Kind == 0 {
 			return "", fmt.Errorf("%w: bad field %+v", ErrInvalidPayload, f)
 		}
 	}
-	id := s.MintID(parent)
+	id := s.MintID(parent, classMarker)
 	c := Class{ID: id, Parent: parent, Name: name, Fields: fields}
-	if err := s.putJSON(ctx, classKey(id), c); err != nil {
+	if err := s.putJSON(ctx, dataKey(id), c); err != nil {
 		return "", err
 	}
 	if name != "" {
@@ -152,7 +156,7 @@ func (s *Store) CreateClass(ctx context.Context, parent ID, name string, fields 
 // GetClass loads a class definition by id.
 func (s *Store) GetClass(ctx context.Context, id ID) (*Class, error) {
 	var c Class
-	if err := s.getJSON(ctx, classKey(id), &c); err != nil {
+	if err := s.getJSON(ctx, dataKey(id), &c); err != nil {
 		if errors.Is(err, ds.ErrNotFound) {
 			return nil, ErrClassUnknown
 		}
@@ -162,15 +166,23 @@ func (s *Store) GetClass(ctx context.Context, id ID) (*Class, error) {
 }
 
 // CreateObject creates an Object of the given class. Field values not
-// present in `values` keep their RDT zero value.
+// present in `values` keep their RDT zero value.  The new object id is
+// rooted at the class id, so the badger key is literally
+// "<classID>/<objectID>".
 func (s *Store) CreateObject(ctx context.Context, classID ID, values map[string]string) (ID, error) {
 	c, err := s.GetClass(ctx, classID)
 	if err != nil {
 		return "", err
 	}
 
+	for k := range values {
+		if !classHasField(c, k) {
+			return "", fmt.Errorf("%w: %q", ErrFieldUnknown, k)
+		}
+	}
+
 	obj := Object{
-		ID:      s.MintID(classID),
+		ID:      s.MintID(classID, objectMarker),
 		ClassID: classID,
 		Fields:  map[string]string{},
 	}
@@ -181,13 +193,8 @@ func (s *Store) CreateObject(ctx context.Context, classID ID, values map[string]
 			obj.Fields[f.Name] = defaultForKind(f.Kind)
 		}
 	}
-	for k := range values {
-		if _, ok := obj.Fields[k]; !ok {
-			return "", fmt.Errorf("%w: unknown field %q", ErrFieldUnknown, k)
-		}
-	}
 
-	if err := s.putJSON(ctx, objectKey(obj.ID), obj); err != nil {
+	if err := s.putJSON(ctx, dataKey(obj.ID), obj); err != nil {
 		return "", err
 	}
 	for name, val := range obj.Fields {
@@ -198,7 +205,9 @@ func (s *Store) CreateObject(ctx context.Context, classID ID, values map[string]
 	return obj.ID, nil
 }
 
-// EditObject merges the provided field values into the object atomically.
+// EditObject merges the provided field values into the object.
+// Each individual field write is a single badger key update; the
+// underlying datastore guarantees per-key atomicity.
 func (s *Store) EditObject(ctx context.Context, id ID, values map[string]string) (ID, error) {
 	obj, err := s.GetObject(ctx, id)
 	if err != nil {
@@ -221,16 +230,18 @@ func (s *Store) EditObject(ctx context.Context, id ID, values map[string]string)
 			return "", err
 		}
 	}
-	if err := s.putJSON(ctx, objectKey(id), obj); err != nil {
+	if err := s.putJSON(ctx, dataKey(id), obj); err != nil {
 		return "", err
 	}
 	return id, nil
 }
 
 // GetObject loads an Object together with its current field values.
+// Field values are read from their leaf keys, which is where the most
+// recent CRDT-merged version lives.
 func (s *Store) GetObject(ctx context.Context, id ID) (*Object, error) {
 	var o Object
-	if err := s.getJSON(ctx, objectKey(id), &o); err != nil {
+	if err := s.getJSON(ctx, dataKey(id), &o); err != nil {
 		if errors.Is(err, ds.ErrNotFound) {
 			return nil, ErrObjectUnknown
 		}
@@ -248,7 +259,7 @@ func (s *Store) GetObject(ctx context.Context, id ID) (*Object, error) {
 	return &o, nil
 }
 
-// SetName creates or updates a {term -> id} mapping, just like Chotki's
+// SetName creates or updates a {term -> id} mapping, mirroring chotki's
 // `name` REPL command and PUT /name HTTP endpoint.
 func (s *Store) SetName(ctx context.Context, term string, id ID) error {
 	if term == "" {
@@ -271,7 +282,8 @@ func (s *Store) LookupName(ctx context.Context, term string) (ID, error) {
 
 // ListNames returns a snapshot of all {term -> id} mappings.
 func (s *Store) ListNames(ctx context.Context) (map[string]ID, error) {
-	res, err := s.ds.Query(ctx, query.Query{Prefix: keySep + keyNamePrefix})
+	prefix := keySep + nameKeyPrefix + keySep
+	res, err := s.ds.Query(ctx, query.Query{Prefix: prefix})
 	if err != nil {
 		return nil, err
 	}
@@ -281,8 +293,47 @@ func (s *Store) ListNames(ctx context.Context) (map[string]ID, error) {
 		if r.Error != nil {
 			return nil, r.Error
 		}
-		key := strings.TrimPrefix(r.Key, keySep+keyNamePrefix+keySep)
-		out[key] = ID(string(r.Value))
+		out[strings.TrimPrefix(r.Key, prefix)] = ID(string(r.Value))
+	}
+	return out, nil
+}
+
+// Children iterates direct children of the given parent id (one
+// hierarchy level only). Useful for "list all objects of class X" or
+// "list all fields of object Y" queries.
+func (s *Store) Children(ctx context.Context, parent ID) ([]ID, error) {
+	prefix := keySep + string(parent) + keySep
+	if parent == "" {
+		prefix = keySep
+	}
+	res, err := s.ds.Query(ctx, query.Query{Prefix: prefix, KeysOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer res.Close()
+	seen := map[string]struct{}{}
+	out := []ID{}
+	for r := range res.Next() {
+		if r.Error != nil {
+			return nil, r.Error
+		}
+		rel := strings.TrimPrefix(r.Key, prefix)
+		// keep only the first segment, ignore deeper descendants
+		if i := strings.Index(rel, keySep); i >= 0 {
+			rel = rel[:i]
+		}
+		if rel == "" || strings.HasPrefix(rel, ".") {
+			continue
+		}
+		full := rel
+		if parent != "" {
+			full = string(parent) + keySep + rel
+		}
+		if _, ok := seen[full]; ok {
+			continue
+		}
+		seen[full] = struct{}{}
+		out = append(out, ID(full))
 	}
 	return out, nil
 }
@@ -297,38 +348,26 @@ func (s *Store) Close() error {
 
 // ---- key construction --------------------------------------------------
 
-// classKey returns the badger key for a class definition.
-//
-//	/class/<classID>
-func classKey(id ID) ds.Key {
-	return ds.NewKey(keySep + keyClassPrefix + keySep + string(id))
+// dataKey returns the badger key that stores the JSON descriptor for a
+// class or object id. The key is literally "/<id>".
+func dataKey(id ID) ds.Key {
+	return ds.NewKey(keySep + string(id))
 }
 
-// objectKey returns the badger key for an object descriptor (header).
-//
-//	/object/<objectID>
-//
-// where objectID itself contains its parent class id thanks to MintID
-// (the data hierarchy is therefore "classID/objectID" implicitly).
-func objectKey(id ID) ds.Key {
-	return ds.NewKey(keySep + keyObjectPrefix + keySep + string(id))
-}
-
-// fieldKey returns the badger key for one field of one object:
-//
-//	/object/<objectID>/field/<name>
+// fieldKey returns the badger key for one field of one object. The key
+// is literally "/<objectID>/<fieldName>" — exactly the
+// "parentID/childID" composition the task asks for.
 func fieldKey(objectID ID, name string) ds.Key {
-	return ds.NewKey(
-		keySep + keyObjectPrefix + keySep + string(objectID) +
-			keySep + keyFieldPrefix + keySep + name,
-	)
+	return ds.NewKey(keySep + string(objectID) + keySep + name)
 }
 
+// nameKey is "/.name/<term>".  The leading dot keeps it out of the
+// regular id namespace while still being a valid badger key.
 func nameKey(term string) ds.Key {
-	return ds.NewKey(keySep + keyNamePrefix + keySep + term)
+	return ds.NewKey(keySep + nameKeyPrefix + keySep + term)
 }
 
-// ---- low-level helpers -------------------------------------------------
+// ---- helpers -----------------------------------------------------------
 
 func (s *Store) putString(ctx context.Context, k ds.Key, v string) error {
 	return s.ds.Put(ctx, k, []byte(v))
@@ -364,12 +403,10 @@ func defaultForKind(k FieldKind) string {
 		return "0.0"
 	case FieldInteger, FieldNCounter, FieldZCounter:
 		return "0"
-	case FieldString:
-		return ""
-	case FieldTerm:
+	case FieldString, FieldTerm:
 		return ""
 	case FieldRef:
-		return string(idRoot)
+		return ""
 	case FieldEulerian, FieldLinear:
 		return "[]"
 	case FieldMapping:
@@ -379,20 +416,23 @@ func defaultForKind(k FieldKind) string {
 	}
 }
 
-func shortHash(s string, n int) string {
-	sum := sha256.Sum256([]byte(s + ":" + time.Now().Format(time.RFC3339Nano)))
+func classHasField(c *Class, name string) bool {
+	for _, f := range c.Fields {
+		if f.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// stableHash returns a deterministic n-hex-char prefix derived from s.
+// Unlike the previous implementation, this does NOT depend on wall-clock
+// time, so the same source always produces the same prefix.
+func stableHash(s string, n int) string {
+	sum := sha256.Sum256([]byte(s))
 	out := hex.EncodeToString(sum[:])
 	if n <= 0 || n > len(out) {
 		return out
 	}
 	return out[:n]
-}
-
-func uint64Bytes(n uint64) []byte {
-	b := make([]byte, 8)
-	for i := 7; i >= 0; i-- {
-		b[i] = byte(n & 0xff)
-		n >>= 8
-	}
-	return b
 }

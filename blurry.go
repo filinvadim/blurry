@@ -36,6 +36,7 @@ func NewBlurry(ctx context.Context, path string, s *Settings) (*Blurry, error) {
 	if s == nil {
 		s = DefaultSettings()
 	}
+	s.SetDefaults()
 	if err := s.Validate(); err != nil {
 		return nil, err
 	}
@@ -65,7 +66,11 @@ func NewBlurry(ctx context.Context, path string, s *Settings) (*Blurry, error) {
 		return nil, err
 	}
 
-	crdt, err := NewCRDT(ctx, gossip, dataStore, node.Host(), node, s.VersionPrefix)
+	crdt, err := NewCRDT(ctx, gossip, dataStore, node.Host(), node, CRDTSettings{
+		VersionPrefix:       s.VersionPrefix,
+		RebroadcastInterval: s.RebroadcastInterval,
+		DAGSyncerTimeout:    s.DAGSyncerTimeout,
+	})
 	if err != nil {
 		_ = dataStore.Close()
 		_ = gossip.Close()
@@ -73,7 +78,15 @@ func NewBlurry(ctx context.Context, path string, s *Settings) (*Blurry, error) {
 		return nil, err
 	}
 
-	store := NewStore(dataStore, node.Host().ID().String())
+	// Pick the store's "source" string in priority order:
+	//   1. user-provided Src (chotki parity)
+	//   2. deterministic Src derived from PrivateKeySeed
+	//   3. fall back to the libp2p peer id
+	storeSource := node.Host().ID().String()
+	if src := s.EffectiveSrc(); src != 0 {
+		storeSource = fmt.Sprintf("%x", src)
+	}
+	store := NewStore(dataStore, storeSource)
 
 	b := &Blurry{
 		settings: s,

@@ -41,13 +41,20 @@ type CRDT struct {
 	cancel      context.CancelFunc
 }
 
+// CRDTSettings carries the subset of Settings the CRDT layer needs.
+type CRDTSettings struct {
+	VersionPrefix       string
+	RebroadcastInterval time.Duration
+	DAGSyncerTimeout    time.Duration
+}
+
 func NewCRDT(
 	ctx context.Context,
 	broadcaster Broadcaster,
 	datastore CRDTStorer,
 	node host.Host,
 	router CRDTRouter,
-	versionPrefix string, // default: empty string
+	cs CRDTSettings,
 ) (*CRDT, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -58,6 +65,15 @@ func NewCRDT(
 	blockService := blockservice.New(blockstore, bitswapExchange)
 	dagService := merkledag.NewDAGService(blockService)
 
+	rebroadcast := cs.RebroadcastInterval
+	if rebroadcast <= 0 {
+		rebroadcast = time.Minute
+	}
+	dagTimeout := cs.DAGSyncerTimeout
+	if dagTimeout <= 0 {
+		dagTimeout = time.Minute
+	}
+
 	opts := crdt.DefaultOptions()
 	opts.Logger = crdtLog
 	opts.PutHook = func(k ds.Key, _ []byte) {
@@ -66,13 +82,13 @@ func NewCRDT(
 	opts.DeleteHook = func(k ds.Key) {
 		crdtLog.Debugf("crdt: item deleted: %s", k.String())
 	}
-	opts.RebroadcastInterval = time.Minute
-	opts.DAGSyncerTimeout = time.Minute
+	opts.RebroadcastInterval = rebroadcast
+	opts.DAGSyncerTimeout = dagTimeout
 	opts.MultiHeadProcessing = true
 
 	crdtStore, err := crdt.New(
 		baseStore,
-		ds.NewKey(versionPrefix),
+		ds.NewKey(cs.VersionPrefix),
 		dagService,
 		broadcaster,
 		opts,
