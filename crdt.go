@@ -19,10 +19,15 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-var logger = logging.Logger("crdt")
+var crdtLog = logging.Logger("crdt")
 
 type CRDTStorer interface {
 	ds.Datastore
+}
+
+type Broadcaster interface {
+	Broadcast(ctx context.Context, data []byte) error
+	Next(ctx context.Context) ([]byte, error)
 }
 
 type CRDTRouter interface {
@@ -54,12 +59,12 @@ func NewCRDT(
 	dagService := merkledag.NewDAGService(blockService)
 
 	opts := crdt.DefaultOptions()
-	opts.Logger = logger
+	opts.Logger = crdtLog
 	opts.PutHook = func(k ds.Key, _ []byte) {
-		logger.Debugf("crdt: item put: %s", k.String())
+		crdtLog.Debugf("crdt: item put: %s", k.String())
 	}
 	opts.DeleteHook = func(k ds.Key) {
-		logger.Debugf("crdt: item deleted: %s", k.String())
+		crdtLog.Debugf("crdt: item deleted: %s", k.String())
 	}
 	opts.RebroadcastInterval = time.Minute
 	opts.DAGSyncerTimeout = time.Minute

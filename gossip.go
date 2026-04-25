@@ -9,7 +9,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 )
 
-var log = logging.Logger("gossip")
+var gossipLog = logging.Logger("gossip")
 
 const gossipTopic = "/gossip/1.0.0"
 
@@ -39,7 +39,7 @@ func NewGossipBroadcaster(ctx context.Context, node host.Host) (*GossipBroadcast
 		return nil, fmt.Errorf("gossip: subscribe: %w", err)
 	}
 
-	log.Infof("gossip: subscribed to topic %s", gossipTopic)
+	gossipLog.Infof("gossip: subscribed to topic %s", gossipTopic)
 
 	return &GossipBroadcaster{topic: topic, sub: sub}, nil
 }
