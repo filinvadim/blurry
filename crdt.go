@@ -59,9 +59,46 @@ func NewCRDT(
 	ctx, cancel := context.WithCancel(ctx)
 
 	baseStore := dssync.MutexWrap(datastore)
-	blockstore := bs.NewBlockstore(baseStore)
+
+	// Match the blockstore wiring used by ipfs-lite (the canonical
+	// reference for go-ds-crdt deployments):
+	//
+	//   - WriteThrough(true): skip the redundant Has() check on every
+	//     Put. The CRDT writes blocks once and never overwrites them,
+	//     so the check just slows commits down.
+	//
+	//   - NewIdStore: synthesise blocks for "identity" multihashes
+	//     (small payloads encoded directly in the CID). Without it
+	//     bitswap can't satisfy WANTs for inline blocks, which the
+	//     CRDT layer occasionally produces for tiny deltas.
+	blockstore := bs.NewIdStore(bs.NewBlockstore(baseStore, bs.WriteThrough(true)))
+
 	bitswapNetwork := bsnet.NewFromIpfsHost(node)
-	bitswapExchange := bitswap.New(ctx, bitswapNetwork, router, blockstore)
+	// ProviderSearchDelay tells the bitswap client how long to wait
+	// before kicking off a content-router lookup. Lowering it speeds up
+	// cold reads in a small cluster where peers are already connected.
+	bitswapExchange := bitswap.New(
+		ctx,
+		bitswapNetwork,
+		router,
+		blockstore,
+		bitswap.ProviderSearchDelay(time.Second),
+	)
+
+	// Replay any libp2p connections that were already established when
+	// bitswap registered as a network notifier. libp2p's swarm.Notify
+	// only fires for FUTURE events, so peers that connected during the
+	// window between libp2p.New() (host starts listening) and
+	// bitswap.New() (handlers wired) would otherwise be invisible to
+	// the bitswap peer manager — leading to "No peers - broadcasting"
+	// loops that never converge in a small cluster. Same pattern that
+	// kubo / ipfs-lite avoid by ensuring nothing inbound can connect
+	// before bitswap is up; we have to do it explicitly because the
+	// host is already exposed by the time NewCRDT is reached.
+	for _, p := range node.Network().Peers() {
+		bitswapExchange.PeerConnected(p)
+	}
+
 	blockService := blockservice.New(blockstore, bitswapExchange)
 	dagService := merkledag.NewDAGService(blockService)
 
