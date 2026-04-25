@@ -1,0 +1,139 @@
+# Three-replica Blurry cluster.
+#
+# Every Settings field is exposed via a BLURRY_<UPPER_SNAKE_CASE> env
+# variable. Override per-service, in a .env file, or via "docker compose
+# --env-file ...". The values below are sensible defaults; tweak them
+# in the per-service `environment:` blocks.
+#
+# Quick start:
+#   docker compose up --build
+#   curl -X POST -d '{Name:S}' http://127.0.0.1:8001/class
+
+x-blurry-env: &blurry-env
+  # ---- identity / runtime --------------------------------------------
+  BLURRY_DATA_DIR: /data
+  BLURRY_NAME: ""
+  BLURRY_PRIVATE_KEY_SEED: ""
+  BLURRY_SRC: "0"
+
+  # ---- libp2p endpoint -----------------------------------------------
+  BLURRY_LISTEN_HOST: 0.0.0.0
+  BLURRY_LISTEN_PORT: "4001"
+
+  # ---- HTTP API ------------------------------------------------------
+  BLURRY_HTTP_HOST: 0.0.0.0
+  BLURRY_HTTP_PORT: "8001"
+
+  # ---- cluster -------------------------------------------------------
+  # Comma-separated list of peers (host:port, bare IP, or multiaddr).
+  BLURRY_CLUSTER_PEERS: ""
+  BLURRY_PRIVATE_NETWORK_PSK: ""
+
+  # ---- libp2p toggles ------------------------------------------------
+  BLURRY_ENABLE_DHT: "true"
+  BLURRY_ENABLE_RELAY: "true"
+  BLURRY_ENABLE_RELAY_SERVICE: "true"
+  BLURRY_ENABLE_HOLE_PUNCHING: "true"
+  BLURRY_ENABLE_NAT_SERVICE: "true"
+  BLURRY_ENABLE_NAT_PORT_MAP: "true"
+  BLURRY_ENABLE_AUTO_NATV2: "true"
+  BLURRY_ENABLE_AUTO_RELAY: "true"
+  BLURRY_ENABLE_METRICS: "false"
+
+  # ---- connection manager --------------------------------------------
+  BLURRY_CONN_LOW_WATER: "20"
+  BLURRY_CONN_HIGH_WATER: "50"
+  BLURRY_CONN_GRACE_PERIOD: 1h
+
+  # ---- chotki.Options parity (timing/sizing) -------------------------
+  BLURRY_PING_PERIOD: 30s
+  BLURRY_PING_WAIT: 10s
+  BLURRY_BROADCAST_QUEUE_MAX_SIZE: "10485760"        # 10 MiB
+  BLURRY_BROADCAST_QUEUE_MIN_BATCH_SIZE: "0"
+  BLURRY_BROADCAST_QUEUE_TIME_LIMIT: 1s
+  BLURRY_READ_ACCUM_TIME_LIMIT: 5s
+  BLURRY_READ_MAX_BUFFER_SIZE: "1048576000"          # 1000 MiB
+  BLURRY_READ_MIN_BUFFER_SIZE_TO_PROCESS: "10240"    # 10 KiB
+  BLURRY_TCP_READ_BUFFER_SIZE: "0"
+  BLURRY_TCP_WRITE_BUFFER_SIZE: "0"
+  BLURRY_WRITE_TIMEOUT: 5m
+  BLURRY_MAX_SYNC_DURATION: 10m
+
+  # ---- CRDT ----------------------------------------------------------
+  BLURRY_VERSION_PREFIX: ""
+  BLURRY_REBROADCAST_INTERVAL: 1m
+  BLURRY_DAG_SYNCER_TIMEOUT: 1m
+
+  # ---- storage -------------------------------------------------------
+  BLURRY_SYNC_WRITES: "true"
+
+  # ---- TLS (paths inside the container; mount via volumes) -----------
+  BLURRY_TLS_CERT_FILE: ""
+  BLURRY_TLS_KEY_FILE: ""
+
+services:
+  blurry-1:
+    build: .
+    image: blurry:local
+    container_name: blurry-1
+    environment:
+      <<: *blurry-env
+      BLURRY_NAME: blurry-1
+      BLURRY_PRIVATE_KEY_SEED: blurry-1-seed
+      BLURRY_HTTP_PORT: "8001"
+      BLURRY_LISTEN_PORT: "4001"
+      BLURRY_CLUSTER_PEERS: "blurry-2:4002,blurry-3:4003"
+    ports:
+      - "4001:4001"
+      - "8001:8001"
+    volumes:
+      - blurry-1-data:/data
+    networks:
+      - blurry
+
+  blurry-2:
+    build: .
+    image: blurry:local
+    container_name: blurry-2
+    environment:
+      <<: *blurry-env
+      BLURRY_NAME: blurry-2
+      BLURRY_PRIVATE_KEY_SEED: blurry-2-seed
+      BLURRY_HTTP_PORT: "8002"
+      BLURRY_LISTEN_PORT: "4002"
+      BLURRY_CLUSTER_PEERS: "blurry-1:4001,blurry-3:4003"
+    ports:
+      - "4002:4002"
+      - "8002:8002"
+    volumes:
+      - blurry-2-data:/data
+    networks:
+      - blurry
+
+  blurry-3:
+    build: .
+    image: blurry:local
+    container_name: blurry-3
+    environment:
+      <<: *blurry-env
+      BLURRY_NAME: blurry-3
+      BLURRY_PRIVATE_KEY_SEED: blurry-3-seed
+      BLURRY_HTTP_PORT: "8003"
+      BLURRY_LISTEN_PORT: "4003"
+      BLURRY_CLUSTER_PEERS: "blurry-1:4001,blurry-2:4002"
+    ports:
+      - "4003:4003"
+      - "8003:8003"
+    volumes:
+      - blurry-3-data:/data
+    networks:
+      - blurry
+
+networks:
+  blurry:
+    driver: bridge
+
+volumes:
+  blurry-1-data:
+  blurry-2-data:
+  blurry-3-data:
