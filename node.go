@@ -2,27 +2,26 @@ package blurry
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
+	"time"
+
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore"
+	logging "github.com/ipfs/go-log/v2"
+	json "github.com/json-iterator/go"
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/event"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/libp2p/go-libp2p/p2p/host/peerstore/pstoremem"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
+	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
-
-	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
-
-	"github.com/libp2p/go-libp2p/core/host"
-	"strings"
-	"time"
-
-	logging "github.com/ipfs/go-log/v2"
-	json "github.com/json-iterator/go"
-	"github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p/core/event"
 )
 
 var nodeLog = logging.Logger("node")
@@ -30,6 +29,10 @@ var nodeLog = logging.Logger("node")
 const (
 	DefaultRelayDataLimit     = 32 << 20 // 32 MiB
 	DefaultRelayDurationLimit = 5 * time.Minute
+
+	// DefaultPrivateNetworkID is used when Settings.PrivateNetworkPSK is
+	// empty. It is padded/truncated to 32 bytes for libp2p PrivateNetwork.
+	DefaultPrivateNetworkID = "blurry-default-private-network."
 )
 
 type Node struct {
@@ -44,21 +47,32 @@ type Node struct {
 	infosChan    chan peer.AddrInfo
 }
 
-func NewNode(
-	ctx context.Context,
-	peers ...string, // TODO Add setting for cluster peers
-) (*Node, error) {
+// NewNode constructs a libp2p host wired up according to Settings.
+// The same Settings always produce the same peer ID (deterministic identity).
+func NewNode(ctx context.Context, s *Settings) (*Node, error) {
+	if s == nil {
+		s = DefaultSettings()
+	}
+	if err := s.Validate(); err != nil {
+		return nil, err
+	}
+
+	priv, err := s.IdentityKey()
+	if err != nil {
+		return nil, err
+	}
+
 	limiter := rcmgr.NewFixedLimiter(rcmgr.DefaultLimits.AutoScale())
 
-	manager, err := connmgr.NewConnManager( // TODO move to settings
-		20,
-		50,
-		connmgr.WithGracePeriod(time.Hour),
+	manager, err := connmgr.NewConnManager(
+		s.ConnLowWater,
+		s.ConnHighWater,
+		connmgr.WithGracePeriod(s.ConnGracePeriod),
 	)
 	if err != nil {
 		return nil, err
 	}
-	rm, err := rcmgr.NewResourceManager(limiter) // TODO move to settings
+	rm, err := rcmgr.NewResourceManager(limiter)
 	if err != nil {
 		return nil, err
 	}
@@ -73,54 +87,74 @@ func NewNode(
 		return mapStore.Close()
 	}
 
-	var infos []peer.AddrInfo
-	for _, p := range peers {
-		info, err := peer.AddrInfoFromString(p) // TODO convert also if it's plain IP
-		if err != nil || info == nil {
-			dhtLog.Warnf("failed to parse peer info from DHT: %s", err)
-			continue
-		}
-		infos = append(infos, *info)
+	infos := ResolvePeerAddrs(s.ClusterPeers, s.ListenPort, func(addr string, err error) {
+		nodeLog.Warnf("node: invalid cluster peer %q: %v", addr, err)
+	})
+
+	psk := s.PrivateNetworkPSK
+	if len(psk) == 0 {
+		psk = padPSK(DefaultPrivateNetworkID)
+	}
+
+	listenAddrs := []string{
+		fmt.Sprintf("/ip4/%s/tcp/%d", s.ListenHost, s.ListenPort),
+	}
+	// Add IPv6 wildcard listener when binding to all-interfaces IPv4.
+	if s.ListenHost == "0.0.0.0" {
+		listenAddrs = append(listenAddrs, fmt.Sprintf("/ip6/::/tcp/%d", s.ListenPort))
 	}
 
 	opts := []libp2p.Option{
+		libp2p.Identity(priv),
 		libp2p.Peerstore(memoryStore),
-		libp2p.PrivateNetwork([]byte("blurry")),
-		libp2p.ListenAddrStrings(
-			fmt.Sprintf("/ip6/%s/tcp/%s", "", ""), // TODO add host and port
-			fmt.Sprintf("/ip4/%s/tcp/%s", "", ""), // TODO add host and port
-		),
-		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
-			// TODO if DHT enabled setting
-			return NewDHT(ctx, h, mapStore, infos...)
-		}),
+		libp2p.PrivateNetwork(psk),
+		libp2p.ListenAddrStrings(listenAddrs...),
 		libp2p.ResourceManager(rm),
 		libp2p.ConnectionManager(manager),
-		libp2p.DisableMetrics(),                       // TODO move to settings
-		libp2p.EnableAutoRelayWithStaticRelays(infos), // TODO move to settings
 		libp2p.Transport(tcp.NewTCPTransport),
 		libp2p.Ping(true),
 		libp2p.Security(noise.ID, noise.New),
-		libp2p.EnableAutoNATv2(), // TODO move to settings
-		libp2p.EnableRelay(),     // TODO move to settings
-		libp2p.EnableRelayService(relayv2.WithResources(relayv2.Resources{ // TODO move to settings
+	}
+
+	if !s.EnableMetrics {
+		opts = append(opts, libp2p.DisableMetrics())
+	}
+	if s.EnableDHT {
+		opts = append(opts, libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
+			return NewDHT(ctx, h, mapStore, infos...)
+		}))
+	}
+	if s.EnableAutoRelay && len(infos) > 0 {
+		opts = append(opts, libp2p.EnableAutoRelayWithStaticRelays(infos))
+	}
+	if s.EnableAutoNATv2 {
+		opts = append(opts, libp2p.EnableAutoNATv2())
+	}
+	if s.EnableRelay {
+		opts = append(opts, libp2p.EnableRelay())
+	}
+	if s.EnableRelayService {
+		opts = append(opts, libp2p.EnableRelayService(relayv2.WithResources(relayv2.Resources{
 			Limit: &relayv2.RelayLimit{
 				Duration: DefaultRelayDurationLimit,
 				Data:     DefaultRelayDataLimit,
 			},
-
-			ReservationTTL: time.Hour,
-
-			MaxReservations: 128,
-			MaxCircuits:     16,
-			BufferSize:      4096,
-
+			ReservationTTL:        time.Hour,
+			MaxReservations:       128,
+			MaxCircuits:           16,
+			BufferSize:            4096,
 			MaxReservationsPerIP:  8,
 			MaxReservationsPerASN: 32,
-		})), // for member nodes that have static IP
-		libp2p.EnableHolePunching(), // TODO move to settings
-		libp2p.EnableNATService(),   // TODO move to settings
-		libp2p.NATPortMap(),         // TODO move to settings
+		})))
+	}
+	if s.EnableHolePunching {
+		opts = append(opts, libp2p.EnableHolePunching())
+	}
+	if s.EnableNATService {
+		opts = append(opts, libp2p.EnableNATService())
+	}
+	if s.EnableNATPortMap {
+		opts = append(opts, libp2p.NATPortMap())
 	}
 
 	node, err := libp2p.New(opts...)
@@ -130,6 +164,7 @@ func NewNode(
 
 	sub, err := node.EventBus().Subscribe(event.WildcardSubscription)
 	if err != nil {
+		_ = node.Close()
 		return nil, fmt.Errorf("node: failed to subscribe: %w", err)
 	}
 	n := &Node{
@@ -139,8 +174,11 @@ func NewNode(
 		eventsSub:    sub,
 		closeF:       closeF,
 		clusterInfos: infos,
-		infosChan:    make(chan peer.AddrInfo, len(infos)),
+		infosChan:    make(chan peer.AddrInfo, max(len(infos), 1)),
 	}
+
+	nodeLog.Infof("node: started with peer id %s, listen %v, cluster size %d",
+		node.ID().String(), node.Addrs(), len(infos))
 
 	go n.trackIncomingEvents()
 	return n, nil
@@ -149,11 +187,53 @@ func NewNode(
 func (n *Node) Host() host.Host {
 	return n.node
 }
-func (n *Node) FindProvidersAsync(ctx context.Context, key cid.Cid, count int) (ch <-chan peer.AddrInfo) {
-	for _, info := range n.clusterInfos {
-		n.infosChan <- info
+
+// ConnectCluster dials every configured cluster peer once. The host's
+// ConnManager is responsible for keeping the connections alive afterwards.
+// Errors per peer are logged and not returned individually.
+func (n *Node) ConnectCluster(ctx context.Context) error {
+	if n == nil || n.node == nil {
+		return errors.New("node: not started")
 	}
-	return n.infosChan
+	ownID := n.node.ID()
+	var firstErr error
+	connected := 0
+	for _, info := range n.clusterInfos {
+		if info.ID == ownID {
+			continue
+		}
+		dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		err := n.node.Connect(dialCtx, info)
+		cancel()
+		if err != nil {
+			nodeLog.Warnf("node: connect %s: %v", info.String(), err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		connected++
+	}
+	nodeLog.Infof("node: connected to %d/%d cluster peers", connected, len(n.clusterInfos))
+	return firstErr
+}
+
+// FindProvidersAsync satisfies the bitswap router interface by returning
+// the configured cluster peers. They are good content providers in a
+// closed cluster topology.
+func (n *Node) FindProvidersAsync(ctx context.Context, key cid.Cid, count int) (ch <-chan peer.AddrInfo) {
+	out := make(chan peer.AddrInfo, max(len(n.clusterInfos), 1))
+	go func() {
+		defer close(out)
+		for _, info := range n.clusterInfos {
+			select {
+			case <-ctx.Done():
+				return
+			case out <- info:
+			}
+		}
+	}()
+	return out
 }
 
 var localAddrActions = map[int]string{
@@ -190,7 +270,7 @@ func (n *Node) trackIncomingEvents() {
 				pid := typedEvent.Peer.String()
 				nodeLog.Infof(
 					"node: event: peer ...%s connectedness updated: %s",
-					pid[len(pid)-6:],
+					tail(pid, 6),
 					typedEvent.Connectedness.String(),
 				)
 			case event.EvtPeerIdentificationFailed:
@@ -200,15 +280,14 @@ func (n *Node) trackIncomingEvents() {
 					"node: event: peer %s %v identification failed, reason: %s",
 					pid.String(), addrs, typedEvent.Reason,
 				)
-
 			case event.EvtPeerIdentificationCompleted:
 				pid := typedEvent.Peer.String()
 				nodeLog.Debugf(
 					"node: event: peer ...%s identification completed, observed address: %s",
-					pid[len(pid)-6:], typedEvent.ObservedAddr.String(),
+					tail(pid, 6), typedEvent.ObservedAddr.String(),
 				)
 			case event.EvtLocalReachabilityChanged:
-				r := typedEvent.Reachability // it's int32 under the hood
+				r := typedEvent.Reachability
 				nodeLog.Infof(
 					"node: event: own node reachability changed: %s",
 					strings.ToLower(r.String()),
@@ -256,7 +335,23 @@ func (n *Node) Close() error {
 	}
 	nodeLog.Infoln("node: event sub closed")
 
-	nodeLog.Infoln("node: relay closed")
-
 	return n.node.Close()
+}
+
+// padPSK derives a 32-byte PSK from any input by repeating/truncating.
+// libp2p's PrivateNetwork requires exactly 32 bytes.
+func padPSK(s string) []byte {
+	const want = 32
+	out := make([]byte, want)
+	for i := 0; i < want; i++ {
+		out[i] = s[i%len(s)]
+	}
+	return out
+}
+
+func tail(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
 }
