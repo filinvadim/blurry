@@ -11,10 +11,11 @@
 
 x-blurry-env: &blurry-env
   # ---- identity / runtime --------------------------------------------
+  # BLURRY_NAME is the canonical identifier: peer id and chotki Src
+  # are derived from it. Two replicas with the same name are the same
+  # logical node.
   BLURRY_DATA_DIR: /data
   BLURRY_NAME: ""
-  BLURRY_PRIVATE_KEY_SEED: ""
-  BLURRY_SRC: "0"
 
   # ---- libp2p endpoint -----------------------------------------------
   BLURRY_LISTEN_HOST: 0.0.0.0
@@ -79,7 +80,6 @@ services:
     environment:
       <<: *blurry-env
       BLURRY_NAME: blurry-1
-      BLURRY_PRIVATE_KEY_SEED: blurry-1-seed
       BLURRY_HTTP_PORT: "8001"
       BLURRY_LISTEN_PORT: "4001"
       BLURRY_CLUSTER_PEERS: "blurry-2:4002,blurry-3:4003"
@@ -98,7 +98,6 @@ services:
     environment:
       <<: *blurry-env
       BLURRY_NAME: blurry-2
-      BLURRY_PRIVATE_KEY_SEED: blurry-2-seed
       BLURRY_HTTP_PORT: "8002"
       BLURRY_LISTEN_PORT: "4002"
       BLURRY_CLUSTER_PEERS: "blurry-1:4001,blurry-3:4003"
@@ -117,7 +116,6 @@ services:
     environment:
       <<: *blurry-env
       BLURRY_NAME: blurry-3
-      BLURRY_PRIVATE_KEY_SEED: blurry-3-seed
       BLURRY_HTTP_PORT: "8003"
       BLURRY_LISTEN_PORT: "4003"
       BLURRY_CLUSTER_PEERS: "blurry-1:4001,blurry-2:4002"

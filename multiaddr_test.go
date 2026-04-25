@@ -75,42 +75,24 @@ func TestResolvePeerAddr(t *testing.T) {
 	}
 }
 
-func TestSettingsDeterministicSrc(t *testing.T) {
-	a := &Settings{PrivateKeySeed: []byte("node-a")}
-	b := &Settings{PrivateKeySeed: []byte("node-a")}
-	c := &Settings{PrivateKeySeed: []byte("node-b")}
-	if a.DeterministicSrc() == 0 {
-		t.Fatal("seed should never produce zero")
+func TestSettingsSrcFromName(t *testing.T) {
+	a := &Settings{Name: "node-a"}
+	b := &Settings{Name: "node-a"}
+	c := &Settings{Name: "node-b"}
+	if a.Src() == 0 {
+		t.Fatal("non-empty name must never produce zero Src")
 	}
-	if a.DeterministicSrc() != b.DeterministicSrc() {
-		t.Fatal("identical seeds → different sources")
+	if a.Src() != b.Src() {
+		t.Fatal("identical names → different Src")
 	}
-	if a.DeterministicSrc() == c.DeterministicSrc() {
-		t.Fatal("different seeds collided")
+	if a.Src() == c.Src() {
+		t.Fatal("different names collided")
 	}
-	if (&Settings{}).DeterministicSrc() != 0 {
-		t.Fatal("empty seed must yield 0")
+	if (&Settings{}).Src() != 0 {
+		t.Fatal("empty name must yield 0")
 	}
-	// Within chotki's 32-bit Source space.
-	if a.DeterministicSrc() > MaxSrc {
-		t.Fatalf("source overflowed 32-bit space: %x", a.DeterministicSrc())
-	}
-}
-
-func TestSettingsEffectiveSrc(t *testing.T) {
-	// Explicit Src wins over the seed.
-	s := &Settings{Src: 0xdeadbeef, PrivateKeySeed: []byte("ignored")}
-	if got := s.EffectiveSrc(); got != 0xdeadbeef {
-		t.Fatalf("got %x", got)
-	}
-	// Falls back to deterministic when Src is unset.
-	s2 := &Settings{PrivateKeySeed: []byte("seed")}
-	if got := s2.EffectiveSrc(); got == 0 || got != s2.DeterministicSrc() {
-		t.Fatalf("got %x", got)
-	}
-	// No identity at all → 0.
-	if got := (&Settings{}).EffectiveSrc(); got != 0 {
-		t.Fatalf("got %x", got)
+	if a.Src() > MaxSrc {
+		t.Fatalf("Src overflowed 32-bit space: %x", a.Src())
 	}
 }
 
@@ -220,8 +202,8 @@ func TestStoreIDDeterminismPerSource(t *testing.T) {
 }
 
 func TestSettingsIdentityKeyDeterminism(t *testing.T) {
-	s1 := &Settings{PrivateKeySeed: []byte("same-seed")}
-	s2 := &Settings{PrivateKeySeed: []byte("same-seed")}
+	s1 := &Settings{Name: "same"}
+	s2 := &Settings{Name: "same"}
 	k1, err := s1.IdentityKey()
 	if err != nil {
 		t.Fatal(err)
@@ -231,15 +213,15 @@ func TestSettingsIdentityKeyDeterminism(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !k1.Equals(k2) {
-		t.Fatalf("identical seeds produced different keys")
+		t.Fatalf("identical names produced different keys")
 	}
 
-	s3 := &Settings{PrivateKeySeed: []byte("different-seed")}
+	s3 := &Settings{Name: "different"}
 	k3, err := s3.IdentityKey()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if k1.Equals(k3) {
-		t.Fatalf("different seeds produced identical keys")
+		t.Fatalf("different names produced identical keys")
 	}
 }

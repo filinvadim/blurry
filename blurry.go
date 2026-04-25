@@ -79,12 +79,11 @@ func NewBlurry(ctx context.Context, path string, s *Settings) (*Blurry, error) {
 		return nil, err
 	}
 
-	// Pick the store's "source" string in priority order:
-	//   1. user-provided Src (chotki parity)
-	//   2. deterministic Src derived from PrivateKeySeed
-	//   3. fall back to the libp2p peer id
+	// Pick the store's "source" string. When Name is configured every
+	// replica derives the same prefix from it (Name → Src → hex);
+	// otherwise we fall back to the libp2p peer id.
 	storeSource := node.Host().ID().String()
-	if src := s.EffectiveSrc(); src != 0 {
+	if src := s.Src(); src != 0 {
 		storeSource = fmt.Sprintf("%x", src)
 	}
 	store := NewStore(dataStore, storeSource)

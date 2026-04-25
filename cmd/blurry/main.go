@@ -74,12 +74,10 @@ func registerFlags(cmd *cobra.Command) {
 	// Storage / runtime.
 	f.String("data_dir", "./data", "badger data directory")
 
-	// Identity.
-	f.String("name", "", "replica name (logging + Y record)")
-	f.String("private_key_seed", "",
-		"deterministic identity seed; empty = random key")
-	f.Uint64("src", 0,
-		"explicit chotki-style 32-bit replica id; 0 = derive from private_key_seed")
+	// Identity. The replica name is the canonical identifier; the
+	// libp2p peer id and the chotki-style Src are derived from it.
+	// Two replicas booted with the same name are the same logical node.
+	f.String("name", "", "replica name (drives peer id and Src)")
 
 	// libp2p endpoint.
 	f.String("listen_host", "0.0.0.0", "libp2p listen host")
@@ -169,8 +167,6 @@ func initViper(cmd *cobra.Command, configPath string) (*viper.Viper, error) {
 func settingsFromViper(v *viper.Viper) (*blurry.Settings, error) {
 	s := &blurry.Settings{
 		Name:                       v.GetString("name"),
-		PrivateKeySeed:             []byte(v.GetString("private_key_seed")),
-		Src:                        v.GetUint64("src"),
 		ListenHost:                 v.GetString("listen_host"),
 		ListenPort:                 v.GetInt("listen_port"),
 		HTTPHost:                   v.GetString("http_host"),

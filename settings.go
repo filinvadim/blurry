@@ -22,21 +22,21 @@ import (
 // translate to gossip parameters).
 type Settings struct {
 	// ---- identity ----------------------------------------------------
-
-	// PrivateKey takes precedence over PrivateKeySeed; if nil, an
-	// Ed25519 key is derived deterministically from PrivateKeySeed.
-	// When both are empty a random key is generated.
-	PrivateKey     crypto.PrivKey
-	PrivateKeySeed []byte
-
-	// Src is the chotki-style replica id (32-bit space). When zero and
-	// PrivateKeySeed is set, Src is derived from the seed via
-	// DeterministicSrc; this keeps a node's identity stable across
-	// restarts without manual book-keeping.
-	Src uint64
-
-	// Replica name (logging + Chotki-compatible Y record).
-	Name string
+	//
+	// A single Name is the canonical identifier for this replica.
+	// Everything stable-identity-related is derived from it:
+	//   * the libp2p peer id (Ed25519 key seeded by Name)
+	//   * the chotki-style 32-bit Src (sha256(Name) → uint32 space)
+	//   * the Store's id-prefix
+	//   * the Y record on first boot
+	//
+	// Two replicas booted with the same Name are the same logical node.
+	// PrivateKey is a programmatic override (used in tests / embedded
+	// deployments where the caller already owns a key); when set it
+	// wins over Name for the libp2p identity but Src/Name still drive
+	// chotki-side bookkeeping.
+	Name       string
+	PrivateKey crypto.PrivKey
 
 	// ---- libp2p network ---------------------------------------------
 
@@ -221,21 +221,18 @@ func (s *Settings) Validate() error {
 	return nil
 }
 
-// MaxSrc bounds DeterministicSrc to chotki's 32-bit Source space
+// MaxSrc bounds derived Source values to chotki's 32-bit Source space
 // (chotki/rdx.MaxSrc).
 const MaxSrc = uint64(1<<32 - 1)
 
-// DeterministicSrc returns a stable replica Source derived from the
-// configured PrivateKeySeed. The result lives in chotki's 32-bit Source
-// space, so the same value can be plugged into chotki.Options.Src.
-//
-// Two replicas seeded with the same bytes share the same Source. An
-// empty seed returns 0.
-func (s *Settings) DeterministicSrc() uint64 {
-	if s == nil || len(s.PrivateKeySeed) == 0 {
+// Src returns the chotki-style 32-bit replica id derived from Name.
+// Two replicas configured with the same Name share the same Src; an
+// empty Name returns 0.
+func (s *Settings) Src() uint64 {
+	if s == nil || s.Name == "" {
 		return 0
 	}
-	sum := sha256.Sum256(s.PrivateKeySeed)
+	sum := sha256.Sum256([]byte(s.Name))
 	v := binary.BigEndian.Uint64(sum[:8]) & MaxSrc
 	if v == 0 {
 		v = 1
@@ -243,28 +240,17 @@ func (s *Settings) DeterministicSrc() uint64 {
 	return v
 }
 
-// EffectiveSrc returns Src when set; otherwise it falls back to
-// DeterministicSrc (when a seed is configured), or 0.
-func (s *Settings) EffectiveSrc() uint64 {
-	if s == nil {
-		return 0
-	}
-	if s.Src != 0 {
-		return s.Src
-	}
-	return s.DeterministicSrc()
-}
-
-// IdentityKey returns the libp2p private key derived from the configured
-// identity material. The same Settings always produce the same peer ID,
-// provided PrivateKey or PrivateKeySeed is set.
+// IdentityKey returns the libp2p private key for this replica. When
+// PrivateKey is set it wins; otherwise an Ed25519 key is derived
+// deterministically from Name. An empty Name and no PrivateKey produce
+// a fresh random key.
 func (s *Settings) IdentityKey() (crypto.PrivKey, error) {
 	if s.PrivateKey != nil {
 		return s.PrivateKey, nil
 	}
-	if len(s.PrivateKeySeed) > 0 {
-		// Hash the seed down to ed25519's required 32-byte size.
-		sum := sha256.Sum256(s.PrivateKeySeed)
+	if s.Name != "" {
+		// Hash Name down to ed25519's required 32-byte seed size.
+		sum := sha256.Sum256([]byte(s.Name))
 		seed := sum[:ed25519.SeedSize]
 		edPriv := ed25519.NewKeyFromSeed(seed)
 		priv, err := crypto.UnmarshalEd25519PrivateKey(edPriv)

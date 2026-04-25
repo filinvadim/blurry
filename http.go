@@ -43,8 +43,11 @@ func NewHTTPServer(b *Blurry) *HTTPServer {
 	return &HTTPServer{b: b}
 }
 
-// Start binds and serves the API on addr (e.g. "127.0.0.1:8001"). It
-// returns immediately; serving runs in a goroutine. Use Close() to stop.
+// Start binds and serves the API on addr (e.g. "127.0.0.1:8001"). When
+// Settings.TlsConfig is non-nil the server is upgraded to HTTPS using
+// the certificates in that config.
+//
+// Returns immediately; serving runs in a goroutine. Use Close() to stop.
 func (h *HTTPServer) Start(addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/listen", withCORS(h.handleListen))
@@ -60,15 +63,28 @@ func (h *HTTPServer) Start(addr string) error {
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		TLSConfig:         h.b.settings.TlsConfig,
 	}
 	h.listen = addr
+	useTLS := h.srv.TLSConfig != nil && len(h.srv.TLSConfig.Certificates) > 0
 	go func() {
-		err := h.srv.ListenAndServe()
+		var err error
+		if useTLS {
+			// Empty cert/key files because the certificates are already
+			// loaded into TLSConfig by the caller (cmd/blurry).
+			err = h.srv.ListenAndServeTLS("", "")
+		} else {
+			err = h.srv.ListenAndServe()
+		}
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			httpLog.Errorf("http: serve %s: %v", addr, err)
 		}
 	}()
-	httpLog.Infof("http: serving on %s", addr)
+	scheme := "http"
+	if useTLS {
+		scheme = "https"
+	}
+	httpLog.Infof("http: serving on %s://%s", scheme, addr)
 	return nil
 }
 
