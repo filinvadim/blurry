@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	logging "github.com/ipfs/go-log/v2"
+	"github.com/libp2p/go-libp2p/core/host"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
@@ -123,14 +124,15 @@ func (b *Blurry) Store() *Store { return b.store }
 // Listen toggles a listen address on the underlying libp2p host. Accepts
 // the same forms ResolvePeerAddr does (multiaddr, host:port, bare IP).
 func (b *Blurry) Listen(addr string) error {
-	if b == nil || b.node == nil || b.node.node == nil {
+	h := b.libp2pHost()
+	if h == nil {
 		return errors.New("blurry: not started")
 	}
 	mAddr, err := dialAddr(addr, b.settings.ListenPort)
 	if err != nil {
 		return err
 	}
-	if err := b.node.node.Network().Listen(mAddr); err != nil {
+	if err := h.Network().Listen(mAddr); err != nil {
 		return fmt.Errorf("blurry: listen %s: %w", addr, err)
 	}
 	return nil
@@ -139,7 +141,8 @@ func (b *Blurry) Listen(addr string) error {
 // Connect dials a single replica. The host's connection manager keeps
 // the link alive afterwards. Use Settings.ClusterPeers for the boot set.
 func (b *Blurry) Connect(ctx context.Context, addr string) error {
-	if b == nil || b.node == nil || b.node.node == nil {
+	h := b.libp2pHost()
+	if h == nil {
 		return errors.New("blurry: not started")
 	}
 	info, err := ResolvePeerAddr(addr, b.settings.ListenPort)
@@ -149,7 +152,16 @@ func (b *Blurry) Connect(ctx context.Context, addr string) error {
 	if info.ID == "" {
 		return errors.New("blurry: peer id is required to connect (use multiaddr with /p2p/<id>)")
 	}
-	return b.node.node.Connect(ctx, info)
+	return h.Connect(ctx, info)
+}
+
+// libp2pHost returns the underlying libp2p host or nil if Blurry is not
+// started yet. Centralised here so the started-check stays consistent.
+func (b *Blurry) libp2pHost() host.Host {
+	if b == nil || b.node == nil {
+		return nil
+	}
+	return b.node.Host()
 }
 
 // resolveRef accepts a name (registered via /name) or a raw id and

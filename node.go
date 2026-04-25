@@ -37,7 +37,7 @@ const (
 
 type Node struct {
 	ctx  context.Context
-	node host.Host
+	host host.Host
 
 	startTime time.Time
 	eventsSub event.Subscription
@@ -157,19 +157,19 @@ func NewNode(ctx context.Context, s *Settings) (*Node, error) {
 		opts = append(opts, libp2p.NATPortMap())
 	}
 
-	node, err := libp2p.New(opts...)
+	h, err := libp2p.New(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("node: failed to init node: %w", err)
 	}
 
-	sub, err := node.EventBus().Subscribe(event.WildcardSubscription)
+	sub, err := h.EventBus().Subscribe(event.WildcardSubscription)
 	if err != nil {
-		_ = node.Close()
+		_ = h.Close()
 		return nil, fmt.Errorf("node: failed to subscribe: %w", err)
 	}
 	n := &Node{
 		ctx:          ctx,
-		node:         node,
+		host:         h,
 		startTime:    time.Now(),
 		eventsSub:    sub,
 		closeF:       closeF,
@@ -178,24 +178,24 @@ func NewNode(ctx context.Context, s *Settings) (*Node, error) {
 	}
 
 	nodeLog.Infof("node: started with peer id %s, listen %v, cluster size %d",
-		node.ID().String(), node.Addrs(), len(infos))
+		h.ID().String(), h.Addrs(), len(infos))
 
 	go n.trackIncomingEvents()
 	return n, nil
 }
 
 func (n *Node) Host() host.Host {
-	return n.node
+	return n.host
 }
 
 // ConnectCluster dials every configured cluster peer once. The host's
 // ConnManager is responsible for keeping the connections alive afterwards.
 // Errors per peer are logged and not returned individually.
 func (n *Node) ConnectCluster(ctx context.Context) error {
-	if n == nil || n.node == nil {
+	if n == nil || n.host == nil {
 		return errors.New("node: not started")
 	}
-	ownID := n.node.ID()
+	ownID := n.host.ID()
 	var firstErr error
 	connected := 0
 	for _, info := range n.clusterInfos {
@@ -203,7 +203,7 @@ func (n *Node) ConnectCluster(ctx context.Context) error {
 			continue
 		}
 		dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		err := n.node.Connect(dialCtx, info)
+		err := n.host.Connect(dialCtx, info)
 		cancel()
 		if err != nil {
 			nodeLog.Warnf("node: connect %s: %v", info.String(), err)
@@ -275,7 +275,7 @@ func (n *Node) trackIncomingEvents() {
 				)
 			case event.EvtPeerIdentificationFailed:
 				pid := typedEvent.Peer
-				addrs := n.node.Peerstore().Addrs(pid)
+				addrs := n.host.Peerstore().Addrs(pid)
 				nodeLog.Errorf(
 					"node: event: peer %s %v identification failed, reason: %s",
 					pid.String(), addrs, typedEvent.Reason,
@@ -325,7 +325,7 @@ func (n *Node) trackIncomingEvents() {
 
 func (n *Node) Close() error {
 	nodeLog.Infoln("node: shutting down node...")
-	if n == nil || n.node == nil {
+	if n == nil || n.host == nil {
 		return nil
 	}
 	_ = n.closeF()
@@ -335,7 +335,7 @@ func (n *Node) Close() error {
 	}
 	nodeLog.Infoln("node: event sub closed")
 
-	return n.node.Close()
+	return n.host.Close()
 }
 
 // padPSK derives a 32-byte PSK from any input by repeating/truncating.
