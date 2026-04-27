@@ -111,6 +111,16 @@ func runBench(t *testing.T, s stackCfg) {
 	// Register the teardown before bringing the stack up so a failed
 	// `up` (which can leave partially-created networks/volumes/containers
 	// behind) still gets cleaned out.
+	dumpLogs := func(reason string) {
+		out, lerr := runCmd(time.Minute,
+			"docker", "compose", "--project-name", s.project, "-f", composePath,
+			"logs", "--no-color", "--tail=200")
+		if lerr != nil {
+			t.Logf("[%s] %s: docker compose logs failed: %v\n%s", s.name, reason, lerr, out)
+			return
+		}
+		t.Logf("[%s] %s — last 200 log lines per service:\n%s", s.name, reason, out)
+	}
 	t.Cleanup(func() {
 		out, derr := runCmd(2*time.Minute,
 			"docker", "compose", "--project-name", s.project, "-f", composePath,
@@ -122,8 +132,15 @@ func runBench(t *testing.T, s stackCfg) {
 	if out, err := runCmd(composeUpWait,
 		"docker", "compose", "--project-name", s.project, "-f", composePath,
 		"up", "-d", "--build", "--wait"); err != nil {
+		dumpLogs("up failed")
 		t.Fatalf("docker compose up: %v\n%s", err, out)
 	}
+
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpLogs("test failed")
+		}
+	})
 
 	if err := waitReady(s.writeURL, 2*time.Minute); err != nil {
 		t.Fatalf("[%s] write replica not ready: %v", s.name, err)
