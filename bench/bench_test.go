@@ -215,6 +215,17 @@ func runBench(t *testing.T, s stackCfg) {
 			t.Logf("[%s] docker compose down: %v\n%s", s.name, derr, out)
 		}
 	})
+	// Wipe any leftover state from a previously interrupted run before
+	// `up`. If a prior invocation got SIGKILLed (kernel OOM, kill -9)
+	// its t.Cleanup never fired and the named volumes still hold old
+	// CRDT objects whose ids collide with what this run will mint
+	// (Blurry's MintID counter restarts at 0 each process), making
+	// /cat return stale data instead of what we just wrote.
+	if out, err := runCmd(2*time.Minute,
+		"docker", "compose", "--project-name", s.project, "-f", composePath,
+		"down", "-v", "--remove-orphans"); err != nil {
+		t.Logf("[%s] pre-up cleanup of stale state: %v\n%s", s.name, err, out)
+	}
 	if out, err := runCmd(composeUpWait,
 		"docker", "compose", "--project-name", s.project, "-f", composePath,
 		"up", "-d", "--build", "--wait"); err != nil {
