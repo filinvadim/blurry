@@ -4,7 +4,7 @@ go 1.25.7
 
 require (
 	github.com/cockroachdb/pebble v1.1.5
-	github.com/drpcorg/chotki v0.0.0-00010101000000-000000000000
+	github.com/drpcorg/chotki v0.0.0-20250905112157-6a3944bc8b7f
 	github.com/ipfs/boxo v0.39.0
 	github.com/ipfs/go-cid v0.6.1
 	github.com/ipfs/go-datastore v0.9.1
@@ -172,5 +172,3 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
-
-replace github.com/drpcorg/chotki => /home/user/chotki

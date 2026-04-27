@@ -11,7 +11,6 @@ import (
 
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/libp2p/go-libp2p/core/host"
-	ma "github.com/multiformats/go-multiaddr"
 )
 
 var blurryLog = logging.Logger("blurry")
