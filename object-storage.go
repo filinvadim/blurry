@@ -205,6 +205,14 @@ func (s *Store) GetClass(ctx context.Context, id ID) (*Class, error) {
 // present in `values` keep their RDT zero value.  The new object id is
 // rooted at the class id, so the badger key is literally
 // "<classID>/<objectID>".
+//
+// All keys (object metadata + every field) are committed via a single
+// ds.Batch when the underlying datastore implements ds.Batching. With
+// the CRDT-wrapped store that's the production path, this collapses
+// what would otherwise be N+1 separate CRDT deltas / DAG nodes /
+// pubsub broadcasts per object into one — the difference between
+// "matches go-ds-crdt's documented 400 keys/s with batching" and
+// "thrashes the wire one Put at a time".
 func (s *Store) CreateObject(ctx context.Context, classID ID, values map[string]string) (ID, error) {
 	c, err := s.GetClass(ctx, classID)
 	if err != nil {
@@ -230,21 +238,26 @@ func (s *Store) CreateObject(ctx context.Context, classID ID, values map[string]
 		}
 	}
 
-	if err := s.putJSON(ctx, dataKey(obj.ID), obj); err != nil {
+	objJSON, err := json.Marshal(obj)
+	if err != nil {
 		return "", err
 	}
+	puts := make([]dsPut, 0, 1+len(obj.Fields))
+	puts = append(puts, dsPut{k: dataKey(obj.ID), v: objJSON})
 	for name, val := range obj.Fields {
-		if err := s.putString(ctx, fieldKey(obj.ID, name), val); err != nil {
-			return "", err
-		}
+		puts = append(puts, dsPut{k: fieldKey(obj.ID, name), v: []byte(val)})
+	}
+	if err := s.commitBatch(ctx, puts); err != nil {
+		return "", err
 	}
 	s.fireCreate(ctx, classID, obj.ID, obj.Fields)
 	return obj.ID, nil
 }
 
 // EditObject merges the provided field values into the object.
-// Each individual field write is a single badger key update; the
-// underlying datastore guarantees per-key atomicity.
+// Updated fields plus the refreshed object metadata are committed as
+// a single ds.Batch so the CRDT replication layer sees one delta per
+// edit instead of one per field.
 func (s *Store) EditObject(ctx context.Context, id ID, values map[string]string) (ID, error) {
 	obj, err := s.GetObject(ctx, id)
 	if err != nil {
@@ -258,16 +271,24 @@ func (s *Store) EditObject(ctx context.Context, id ID, values map[string]string)
 	for _, f := range c.Fields {
 		known[f.Name] = struct{}{}
 	}
-	for name, v := range values {
+	for name := range values {
 		if _, ok := known[name]; !ok {
 			return "", fmt.Errorf("%w: %q", ErrFieldUnknown, name)
 		}
-		obj.Fields[name] = v
-		if err := s.putString(ctx, fieldKey(id, name), v); err != nil {
-			return "", err
-		}
 	}
-	if err := s.putJSON(ctx, dataKey(id), obj); err != nil {
+	for name, v := range values {
+		obj.Fields[name] = v
+	}
+	objJSON, err := json.Marshal(obj)
+	if err != nil {
+		return "", err
+	}
+	puts := make([]dsPut, 0, 1+len(values))
+	for name, v := range values {
+		puts = append(puts, dsPut{k: fieldKey(id, name), v: []byte(v)})
+	}
+	puts = append(puts, dsPut{k: dataKey(id), v: objJSON})
+	if err := s.commitBatch(ctx, puts); err != nil {
 		return "", err
 	}
 	s.fireEdit(ctx, obj.ClassID, id, values)
@@ -406,6 +427,38 @@ func nameKey(term string) ds.Key {
 }
 
 // ---- helpers -----------------------------------------------------------
+
+// dsPut is one queued key/value write inside a commitBatch call.
+type dsPut struct {
+	k ds.Key
+	v []byte
+}
+
+// commitBatch writes every (k,v) pair through a single ds.Batch when the
+// underlying datastore supports it (the CRDT-wrapped store does), so the
+// caller doesn't pay the per-Put broadcast cost. Falls back to N
+// sequential Puts otherwise — still correct, just no application-level
+// grouping.
+func (s *Store) commitBatch(ctx context.Context, puts []dsPut) error {
+	if b, ok := s.ds.(ds.Batching); ok {
+		batch, err := b.Batch(ctx)
+		if err != nil {
+			return err
+		}
+		for _, p := range puts {
+			if err := batch.Put(ctx, p.k, p.v); err != nil {
+				return err
+			}
+		}
+		return batch.Commit(ctx)
+	}
+	for _, p := range puts {
+		if err := s.ds.Put(ctx, p.k, p.v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 func (s *Store) putString(ctx context.Context, k ds.Key, v string) error {
 	return s.ds.Put(ctx, k, []byte(v))
