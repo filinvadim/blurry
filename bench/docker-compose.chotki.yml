@@ -1,83 +1,76 @@
 # Three-replica Chotki cluster (bench harness).
 #
-# Image is built from bench/cmd/chotki-bench/Dockerfile, which clones
-# drpcorg/chotki at build time (override via build arg CHOTKI_REF) and
-# compiles a small wrapper that exposes Chotki over HTTP on 0.0.0.0.
+# Each container runs the official chotki repl binary built from the
+# upstream drpcorg/chotki repository (see ./chotki/Dockerfile). No
+# bench-side wrapper sits between the test and chotki; the test talks
+# directly to the repl's HTTP handlers (POST /class, POST /new, GET
+# /cat). socat forwards 0.0.0.0:$HTTP_PORT to chotki's localhost-only
+# servehttp inside the container so it is reachable from outside.
 #
-# The replicas form a spanning tree (chotki only allows connecting to
+# Replicas form a spanning tree (chotki only allows connecting to
 # lesser src numbers): chotki-3 -> chotki-2 -> chotki-1.
 #
 # Quick start (from the repo root):
 #   docker compose -f bench/docker-compose.chotki.yml up --build
-#   curl -X POST -d '{Name:S}' http://127.0.0.1:9001/class
 
-x-chotki-env: &chotki-env
-  CHOTKI_DATA_DIR: /data
+x-chotki-build: &chotki-build
+  build:
+    context: ./chotki
+  image: chotki-bench:local
+
+x-chotki-base: &chotki-base
+  <<: *chotki-build
+  tty: true
+  stdin_open: true
+  networks:
+    - chotki
 
 services:
   chotki-1:
-    build:
-      context: ./cmd/chotki-bench
-    image: chotki-bench:local
-    container_name: chotki-1
+    <<: *chotki-base
     environment:
-      <<: *chotki-env
-      CHOTKI_SRC: "1"
-      CHOTKI_NAME: chotki-1
-      CHOTKI_LISTEN: 0.0.0.0:4001
-      CHOTKI_HTTP_LISTEN: 0.0.0.0:8001
-      CHOTKI_PEERS: ""
+      SRC: "1"
+      LISTEN_ADDR: 0.0.0.0:4001
+      HTTP_PORT: "8001"
+      INTERNAL_HTTP_PORT: "18001"
+      PEERS: ""
     ports:
-      - "14001:4001"
       - "9001:8001"
+      - "14001:4001"
     volumes:
       - chotki-1-data:/data
-    networks:
-      - chotki
 
   chotki-2:
-    build:
-      context: ./cmd/chotki-bench
-    image: chotki-bench:local
-    container_name: chotki-2
+    <<: *chotki-base
     environment:
-      <<: *chotki-env
-      CHOTKI_SRC: "2"
-      CHOTKI_NAME: chotki-2
-      CHOTKI_LISTEN: 0.0.0.0:4002
-      CHOTKI_HTTP_LISTEN: 0.0.0.0:8002
-      CHOTKI_PEERS: chotki-1:4001
+      SRC: "2"
+      LISTEN_ADDR: 0.0.0.0:4001
+      HTTP_PORT: "8001"
+      INTERNAL_HTTP_PORT: "18001"
+      PEERS: chotki-1:4001
     ports:
-      - "14002:4002"
-      - "9002:8002"
+      - "9002:8001"
+      - "14002:4001"
     volumes:
       - chotki-2-data:/data
     depends_on:
       - chotki-1
-    networks:
-      - chotki
 
   chotki-3:
-    build:
-      context: ./cmd/chotki-bench
-    image: chotki-bench:local
-    container_name: chotki-3
+    <<: *chotki-base
     environment:
-      <<: *chotki-env
-      CHOTKI_SRC: "3"
-      CHOTKI_NAME: chotki-3
-      CHOTKI_LISTEN: 0.0.0.0:4003
-      CHOTKI_HTTP_LISTEN: 0.0.0.0:8003
-      CHOTKI_PEERS: chotki-2:4002
+      SRC: "3"
+      LISTEN_ADDR: 0.0.0.0:4001
+      HTTP_PORT: "8001"
+      INTERNAL_HTTP_PORT: "18001"
+      PEERS: chotki-2:4001
     ports:
-      - "14003:4003"
-      - "9003:8003"
+      - "9003:8001"
+      - "14003:4001"
     volumes:
       - chotki-3-data:/data
     depends_on:
       - chotki-2
-    networks:
-      - chotki
 
 networks:
   chotki:
