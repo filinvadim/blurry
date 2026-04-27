@@ -1,12 +1,15 @@
-# Three-replica Blurry cluster.
+# Three-replica Blurry cluster (bench harness).
+#
+# Build context is the parent directory (the Blurry repo root) so the
+# existing project Dockerfile is picked up unchanged.
 #
 # Every Settings field is exposed via a BLURRY_<UPPER_SNAKE_CASE> env
 # variable. Override per-service, in a .env file, or via "docker compose
 # --env-file ...". The values below are sensible defaults; tweak them
 # in the per-service `environment:` blocks.
 #
-# Quick start:
-#   docker compose up --build
+# Quick start (from the repo root):
+#   docker compose -f bench/docker-compose.blurry.yml up --build
 #   curl -X POST -d '{Name:S}' http://127.0.0.1:8001/class
 
 x-blurry-env: &blurry-env
@@ -74,7 +77,9 @@ x-blurry-env: &blurry-env
 
 services:
   blurry-1:
-    build: .
+    build:
+      context: ..
+      dockerfile: Dockerfile
     image: blurry:local
     container_name: blurry-1
     environment:
@@ -97,7 +102,9 @@ services:
       - blurry
 
   blurry-2:
-    build: .
+    build:
+      context: ..
+      dockerfile: Dockerfile
     image: blurry:local
     container_name: blurry-2
     environment:
@@ -116,7 +123,9 @@ services:
       - blurry
 
   blurry-3:
-    build: .
+    build:
+      context: ..
+      dockerfile: Dockerfile
     image: blurry:local
     container_name: blurry-3
     environment:

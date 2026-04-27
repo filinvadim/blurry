@@ -1,0 +1,89 @@
+# Three-replica Chotki cluster (bench harness).
+#
+# Image is built from bench/cmd/chotki-bench/Dockerfile, which clones
+# drpcorg/chotki at build time (override via build arg CHOTKI_REF) and
+# compiles a small wrapper that exposes Chotki over HTTP on 0.0.0.0.
+#
+# The replicas form a spanning tree (chotki only allows connecting to
+# lesser src numbers): chotki-3 -> chotki-2 -> chotki-1.
+#
+# Quick start (from the repo root):
+#   docker compose -f bench/docker-compose.chotki.yml up --build
+#   curl -X POST -d '{Name:S}' http://127.0.0.1:9001/class
+
+x-chotki-env: &chotki-env
+  CHOTKI_DATA_DIR: /data
+
+services:
+  chotki-1:
+    build:
+      context: ./cmd/chotki-bench
+    image: chotki-bench:local
+    container_name: chotki-1
+    environment:
+      <<: *chotki-env
+      CHOTKI_SRC: "1"
+      CHOTKI_NAME: chotki-1
+      CHOTKI_LISTEN: 0.0.0.0:4001
+      CHOTKI_HTTP_LISTEN: 0.0.0.0:8001
+      CHOTKI_PEERS: ""
+    ports:
+      - "14001:4001"
+      - "9001:8001"
+    volumes:
+      - chotki-1-data:/data
+    networks:
+      - chotki
+
+  chotki-2:
+    build:
+      context: ./cmd/chotki-bench
+    image: chotki-bench:local
+    container_name: chotki-2
+    environment:
+      <<: *chotki-env
+      CHOTKI_SRC: "2"
+      CHOTKI_NAME: chotki-2
+      CHOTKI_LISTEN: 0.0.0.0:4002
+      CHOTKI_HTTP_LISTEN: 0.0.0.0:8002
+      CHOTKI_PEERS: chotki-1:4001
+    ports:
+      - "14002:4002"
+      - "9002:8002"
+    volumes:
+      - chotki-2-data:/data
+    depends_on:
+      - chotki-1
+    networks:
+      - chotki
+
+  chotki-3:
+    build:
+      context: ./cmd/chotki-bench
+    image: chotki-bench:local
+    container_name: chotki-3
+    environment:
+      <<: *chotki-env
+      CHOTKI_SRC: "3"
+      CHOTKI_NAME: chotki-3
+      CHOTKI_LISTEN: 0.0.0.0:4003
+      CHOTKI_HTTP_LISTEN: 0.0.0.0:8003
+      CHOTKI_PEERS: chotki-2:4002
+    ports:
+      - "14003:4003"
+      - "9003:8003"
+    volumes:
+      - chotki-3-data:/data
+    depends_on:
+      - chotki-2
+    networks:
+      - chotki
+
+networks:
+  chotki:
+    driver: bridge
+
+volumes:
+  chotki-1-data:
+  chotki-2-data:
+  chotki-3-data:
