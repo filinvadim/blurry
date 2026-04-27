@@ -76,6 +76,11 @@ x-blurry-env: &blurry-env
   BLURRY_TLS_KEY_FILE: ""
 
 services:
+  # Only blurry-1 declares `build:`. blurry-2/3 reference the already-built
+  # image: declaring `build:` on every service makes `docker compose up
+  # --build` race three concurrent builders against the same image tag,
+  # and one of them eventually fails with "image: already exists" during
+  # export.
   blurry-1:
     build:
       context: ..
@@ -102,11 +107,10 @@ services:
       - blurry
 
   blurry-2:
-    build:
-      context: ..
-      dockerfile: Dockerfile
     image: blurry:local
     container_name: blurry-2
+    depends_on:
+      - blurry-1
     environment:
       <<: *blurry-env
       BLURRY_NAME: blurry-2
@@ -123,11 +127,10 @@ services:
       - blurry
 
   blurry-3:
-    build:
-      context: ..
-      dockerfile: Dockerfile
     image: blurry:local
     container_name: blurry-3
+    depends_on:
+      - blurry-1
     environment:
       <<: *blurry-env
       BLURRY_NAME: blurry-3

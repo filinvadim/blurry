@@ -19,15 +19,24 @@ x-chotki-build: &chotki-build
   image: chotki-bench:local
 
 x-chotki-base: &chotki-base
-  <<: *chotki-build
+  image: chotki-bench:local
   tty: true
   stdin_open: true
   networks:
     - chotki
 
 services:
+  # Only chotki-1 declares `build:`. chotki-2 and chotki-3 reference the
+  # already-built image: declaring `build:` on every service makes
+  # `docker compose up --build` race three concurrent builders against
+  # the same image tag, and one of them eventually fails with
+  # "image: already exists" during export.
   chotki-1:
-    <<: *chotki-base
+    <<: *chotki-build
+    tty: true
+    stdin_open: true
+    networks:
+      - chotki
     environment:
       SRC: "1"
       LISTEN_ADDR: 0.0.0.0:4001

@@ -32,7 +32,7 @@ RUN git clone "${CHOTKI_REPO}" /chotki && \
     rm -rf /chotki/.git
 
 # ---- build ------------------------------------------------------------
-FROM golang:1.25-alpine AS build
+FROM golang:1.26-alpine AS build
 RUN apk add --no-cache ca-certificates
 COPY --from=fetch /chotki /chotki
 
