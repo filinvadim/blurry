@@ -17,7 +17,7 @@ x-blurry-env: &blurry-env
   # BLURRY_NAME is the canonical identifier: peer id and chotki Src
   # are derived from it. Two replicas with the same name are the same
   # logical node.
-  BLURRY_DATA_DIR: /data
+  BLURRY_DATA_DIR: /tmp/blurry
   BLURRY_NAME: ""
 
   # ---- libp2p endpoint -----------------------------------------------
@@ -102,7 +102,7 @@ services:
       - "4001:4001"
       - "8001:8001"
     volumes:
-      - blurry-1-data:/data
+      - blurry-1-data:/tmp/blurry
     networks:
       - blurry
 
@@ -122,7 +122,7 @@ services:
       - "4002:4002"
       - "8002:8002"
     volumes:
-      - blurry-2-data:/data
+      - blurry-2-data:/tmp/blurry
     networks:
       - blurry
 
@@ -142,7 +142,7 @@ services:
       - "4003:4003"
       - "8003:8003"
     volumes:
-      - blurry-3-data:/data
+      - blurry-3-data:/tmp/blurry
     networks:
       - blurry
 

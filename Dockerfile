@@ -27,9 +27,12 @@ COPY --from=build /out/blurry /usr/local/bin/blurry
 # libp2p (TCP) and HTTP API.
 EXPOSE 4001 8001
 
-VOLUME ["/data"]
+# Live under /tmp so the distroless `nonroot` user can write without
+# extra ownership gymnastics — /tmp is world-writable and named
+# volumes mounted there inherit perms the user can use.
+VOLUME ["/tmp/blurry"]
 
-ENV BLURRY_DATA_DIR=/data \
+ENV BLURRY_DATA_DIR=/tmp/blurry \
     BLURRY_LISTEN_HOST=0.0.0.0 \
     BLURRY_LISTEN_PORT=4001 \
     BLURRY_HTTP_HOST=0.0.0.0 \
