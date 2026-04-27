@@ -3,10 +3,15 @@
 # Build context is the parent directory (the Blurry repo root) so the
 # existing project Dockerfile is picked up unchanged.
 #
-# Every Settings field is exposed via a BLURRY_<UPPER_SNAKE_CASE> env
-# variable. Override per-service, in a .env file, or via "docker compose
-# --env-file ...". The values below are sensible defaults; tweak them
-# in the per-service `environment:` blocks.
+# This compose strips the env block down to the settings Blurry's
+# runtime actually consumes. The chotki-parity timing/sizing knobs
+# (BroadcastQueue*, ReadAccum*, ReadMinBuffer*, TcpRead/Write,
+# PingPeriod, MaxSyncDuration, WriteTimeout) are dead weight for
+# Blurry — they are parsed and stored, but only the optional
+# chotki-bridge feature reads them, which the bench doesn't use.
+# libp2p public-internet features (DHT, relay, hole punching, NAT) are
+# also off because all three replicas are on a single Docker network
+# with explicit, deterministic peer addresses.
 #
 # Quick start (from the repo root):
 #   docker compose -f bench/docker-compose.blurry.yml up --build
@@ -34,14 +39,16 @@ x-blurry-env: &blurry-env
   BLURRY_PRIVATE_NETWORK_PSK: ""
 
   # ---- libp2p toggles ------------------------------------------------
-  BLURRY_ENABLE_DHT: "true"
-  BLURRY_ENABLE_RELAY: "true"
-  BLURRY_ENABLE_RELAY_SERVICE: "true"
-  BLURRY_ENABLE_HOLE_PUNCHING: "true"
-  BLURRY_ENABLE_NAT_SERVICE: "true"
-  BLURRY_ENABLE_NAT_PORT_MAP: "true"
-  BLURRY_ENABLE_AUTO_NATV2: "true"
-  BLURRY_ENABLE_AUTO_RELAY: "true"
+  # All off: peers are explicit, the network is a Docker bridge, and
+  # the bench doesn't need DHT routing, relay paths, or NAT traversal.
+  BLURRY_ENABLE_DHT: "false"
+  BLURRY_ENABLE_RELAY: "false"
+  BLURRY_ENABLE_RELAY_SERVICE: "false"
+  BLURRY_ENABLE_HOLE_PUNCHING: "false"
+  BLURRY_ENABLE_NAT_SERVICE: "false"
+  BLURRY_ENABLE_NAT_PORT_MAP: "false"
+  BLURRY_ENABLE_AUTO_NATV2: "false"
+  BLURRY_ENABLE_AUTO_RELAY: "false"
   BLURRY_ENABLE_METRICS: "false"
 
   # ---- connection manager --------------------------------------------
@@ -49,21 +56,7 @@ x-blurry-env: &blurry-env
   BLURRY_CONN_HIGH_WATER: "50"
   BLURRY_CONN_GRACE_PERIOD: 1h
 
-  # ---- chotki.Options parity (timing/sizing) -------------------------
-  BLURRY_PING_PERIOD: 30s
-  BLURRY_PING_WAIT: 10s
-  BLURRY_BROADCAST_QUEUE_MAX_SIZE: "10485760"        # 10 MiB
-  BLURRY_BROADCAST_QUEUE_MIN_BATCH_SIZE: "0"
-  BLURRY_BROADCAST_QUEUE_TIME_LIMIT: 1s
-  BLURRY_READ_ACCUM_TIME_LIMIT: 5s
-  BLURRY_READ_MAX_BUFFER_SIZE: "1048576000"          # 1000 MiB
-  BLURRY_READ_MIN_BUFFER_SIZE_TO_PROCESS: "10240"    # 10 KiB
-  BLURRY_TCP_READ_BUFFER_SIZE: "0"
-  BLURRY_TCP_WRITE_BUFFER_SIZE: "0"
-  BLURRY_WRITE_TIMEOUT: 5m
-  BLURRY_MAX_SYNC_DURATION: 10m
-
-  # ---- CRDT ----------------------------------------------------------
+  # ---- CRDT (go-ds-crdt) ---------------------------------------------
   BLURRY_VERSION_PREFIX: ""
   BLURRY_REBROADCAST_INTERVAL: 30s
   BLURRY_DAG_SYNCER_TIMEOUT: 5m
