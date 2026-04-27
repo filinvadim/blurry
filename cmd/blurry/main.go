@@ -41,10 +41,11 @@ func newRootCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "blurry",
-		Short: "Run a Blurry replica with Chotki-compatible HTTP API",
+		Short: "Run a Blurry replica with a key/value HTTP API",
 		Long: `Blurry is a CRDT-backed key/value store running on libp2p with a
-Chotki-compatible REST API. Settings are read from flags, environment
-variables (BLURRY_*) and an optional config file.`,
+small REST API (GET/PUT/DELETE /v1/kv/:key + PUT /v1/batch). Settings
+are read from flags, environment variables (BLURRY_*) and an optional
+config file.`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			v, err := initViper(cmd, configPath)
@@ -66,17 +67,15 @@ variables (BLURRY_*) and an optional config file.`,
 	return cmd
 }
 
-// registerFlags binds all Settings knobs as CLI flags. Each flag also
-// has a corresponding BLURRY_<UPPER> env var (set up in initViper).
+// registerFlags binds Settings knobs as CLI flags. Each flag also has
+// a corresponding BLURRY_<UPPER> env var (set up in initViper).
 func registerFlags(cmd *cobra.Command) {
 	f := cmd.PersistentFlags()
 
 	// Storage / runtime.
 	f.String("data_dir", "./data", "badger data directory")
 
-	// Identity. The replica name is the canonical identifier; the
-	// libp2p peer id and the chotki-style Src are derived from it.
-	// Two replicas booted with the same name are the same logical node.
+	// Identity.
 	f.String("name", "", "replica name (drives peer id and Src)")
 
 	// libp2p endpoint.
@@ -109,20 +108,6 @@ func registerFlags(cmd *cobra.Command) {
 	f.Int("conn_high_water", 50, "ConnManager high watermark")
 	f.Duration("conn_grace_period", time.Hour, "ConnManager grace period")
 
-	// chotki.Options-parity timing/sizing.
-	f.Duration("ping_period", 30*time.Second, "ping interval to neighbour replicas")
-	f.Duration("ping_wait", 10*time.Second, "ping response timeout")
-	f.Int("broadcast_queue_max_size", 10*1024*1024, "broadcast queue max bytes")
-	f.Int("broadcast_queue_min_batch_size", 0, "broadcast queue min batch bytes")
-	f.Duration("broadcast_queue_time_limit", time.Second, "broadcast queue flush deadline")
-	f.Duration("read_accum_time_limit", 5*time.Second, "read accumulator flush deadline")
-	f.Int("read_max_buffer_size", 1024*1024*1000, "read max buffer bytes")
-	f.Int("read_min_buffer_size_to_process", 10*1024, "read min buffer bytes before processing")
-	f.Int("tcp_read_buffer_size", 0, "TCP read buffer size (0 = OS default)")
-	f.Int("tcp_write_buffer_size", 0, "TCP write buffer size (0 = OS default)")
-	f.Duration("write_timeout", 5*time.Minute, "write timeout")
-	f.Duration("max_sync_duration", 10*time.Minute, "max sync duration")
-
 	// CRDT.
 	f.String("version_prefix", "", "CRDT version key prefix")
 	f.Duration("rebroadcast_interval", time.Minute, "CRDT rebroadcast interval")
@@ -131,14 +116,9 @@ func registerFlags(cmd *cobra.Command) {
 	// Storage.
 	f.Bool("sync_writes", true, "fsync badger on every write (ACID)")
 
-	// TLS for the HTTP server / libp2p TLS transport.
+	// TLS.
 	f.String("tls_cert_file", "", "TLS certificate file (PEM)")
 	f.String("tls_key_file", "", "TLS private key file (PEM)")
-
-	// Chotki wire-protocol bridge (PoC).
-	f.String("chotki_peer", "", "chotki host:port to bridge to (empty = bridge disabled)")
-	f.String("chotki_mirror_class", "ChotkiMirror", "local Blurry class used to mirror chotki objects")
-	f.String("chotki_class_id", "", "rdx.ID of the corresponding chotki class (e.g. \"1f-2\")")
 }
 
 // initViper wires viper to the cobra flag set, the BLURRY_* env namespace
@@ -146,12 +126,10 @@ func registerFlags(cmd *cobra.Command) {
 func initViper(cmd *cobra.Command, configPath string) (*viper.Viper, error) {
 	v := viper.New()
 
-	// CLI flags take highest precedence after explicit overrides.
 	if err := v.BindPFlags(cmd.PersistentFlags()); err != nil {
 		return nil, fmt.Errorf("bind flags: %w", err)
 	}
 
-	// Env namespace: BLURRY_LISTEN_PORT etc.
 	v.SetEnvPrefix(envPrefix)
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
 	v.AutomaticEnv()
@@ -171,45 +149,29 @@ func initViper(cmd *cobra.Command, configPath string) (*viper.Viper, error) {
 // settingsFromViper materializes a *blurry.Settings from a populated viper.
 func settingsFromViper(v *viper.Viper) (*blurry.Settings, error) {
 	s := &blurry.Settings{
-		Name:                       v.GetString("name"),
-		ListenHost:                 v.GetString("listen_host"),
-		ListenPort:                 v.GetInt("listen_port"),
-		HTTPHost:                   v.GetString("http_host"),
-		HTTPPort:                   v.GetInt("http_port"),
-		ClusterPeers:               splitList(v.GetStringSlice("cluster_peers")),
-		PrivateNetworkPSK:          []byte(v.GetString("private_network_psk")),
-		EnableDHT:                  v.GetBool("enable_dht"),
-		EnableRelay:                v.GetBool("enable_relay"),
-		EnableRelayService:         v.GetBool("enable_relay_service"),
-		EnableHolePunching:         v.GetBool("enable_hole_punching"),
-		EnableNATService:           v.GetBool("enable_nat_service"),
-		EnableNATPortMap:           v.GetBool("enable_nat_port_map"),
-		EnableAutoNATv2:            v.GetBool("enable_auto_natv2"),
-		EnableAutoRelay:            v.GetBool("enable_auto_relay"),
-		EnableMetrics:              v.GetBool("enable_metrics"),
-		ConnLowWater:               v.GetInt("conn_low_water"),
-		ConnHighWater:              v.GetInt("conn_high_water"),
-		ConnGracePeriod:            v.GetDuration("conn_grace_period"),
-		PingPeriod:                 v.GetDuration("ping_period"),
-		PingWait:                   v.GetDuration("ping_wait"),
-		BroadcastQueueMaxSize:      v.GetInt("broadcast_queue_max_size"),
-		BroadcastQueueMinBatchSize: v.GetInt("broadcast_queue_min_batch_size"),
-		BroadcastQueueTimeLimit:    v.GetDuration("broadcast_queue_time_limit"),
-		ReadAccumTimeLimit:         v.GetDuration("read_accum_time_limit"),
-		ReadMaxBufferSize:          v.GetInt("read_max_buffer_size"),
-		ReadMinBufferSizeToProcess: v.GetInt("read_min_buffer_size_to_process"),
-		TcpReadBufferSize:          v.GetInt("tcp_read_buffer_size"),
-		TcpWriteBufferSize:         v.GetInt("tcp_write_buffer_size"),
-		WriteTimeout:               v.GetDuration("write_timeout"),
-		MaxSyncDuration:            v.GetDuration("max_sync_duration"),
-		VersionPrefix:              v.GetString("version_prefix"),
-		RebroadcastInterval:        v.GetDuration("rebroadcast_interval"),
-		DAGSyncerTimeout:           v.GetDuration("dag_syncer_timeout"),
-		SyncWrites:                 v.GetBool("sync_writes"),
-
-		ChotkiPeer:        v.GetString("chotki_peer"),
-		ChotkiMirrorClass: v.GetString("chotki_mirror_class"),
-		ChotkiClassID:     v.GetString("chotki_class_id"),
+		Name:                v.GetString("name"),
+		ListenHost:          v.GetString("listen_host"),
+		ListenPort:          v.GetInt("listen_port"),
+		HTTPHost:            v.GetString("http_host"),
+		HTTPPort:            v.GetInt("http_port"),
+		ClusterPeers:        splitList(v.GetStringSlice("cluster_peers")),
+		PrivateNetworkPSK:   []byte(v.GetString("private_network_psk")),
+		EnableDHT:           v.GetBool("enable_dht"),
+		EnableRelay:         v.GetBool("enable_relay"),
+		EnableRelayService:  v.GetBool("enable_relay_service"),
+		EnableHolePunching:  v.GetBool("enable_hole_punching"),
+		EnableNATService:    v.GetBool("enable_nat_service"),
+		EnableNATPortMap:    v.GetBool("enable_nat_port_map"),
+		EnableAutoNATv2:     v.GetBool("enable_auto_natv2"),
+		EnableAutoRelay:     v.GetBool("enable_auto_relay"),
+		EnableMetrics:       v.GetBool("enable_metrics"),
+		ConnLowWater:        v.GetInt("conn_low_water"),
+		ConnHighWater:       v.GetInt("conn_high_water"),
+		ConnGracePeriod:     v.GetDuration("conn_grace_period"),
+		VersionPrefix:       v.GetString("version_prefix"),
+		RebroadcastInterval: v.GetDuration("rebroadcast_interval"),
+		DAGSyncerTimeout:    v.GetDuration("dag_syncer_timeout"),
+		SyncWrites:          v.GetBool("sync_writes"),
 	}
 
 	if cert, key := v.GetString("tls_cert_file"), v.GetString("tls_key_file"); cert != "" || key != "" {
@@ -272,9 +234,6 @@ func run(ctx context.Context, s *blurry.Settings, dataDir string) error {
 
 	<-ctx.Done()
 	fmt.Fprintln(os.Stderr, "blurry: shutting down")
-	// b.Close() may surface context.Canceled from sub-components that
-	// observed the same signal-driven cancellation; that's not a real
-	// failure of the shutdown path.
 	if err := b.Close(); err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}

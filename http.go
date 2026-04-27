@@ -2,81 +2,88 @@ package blurry
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"sort"
+	"net"
 	"strings"
 	"time"
 
+	"github.com/gofiber/fiber/v3"
 	logging "github.com/ipfs/go-log/v2"
 )
 
 var httpLog = logging.Logger("http")
 
-// HTTPServer exposes a Chotki-compatible REST API on top of a Blurry
-// instance. The endpoints mirror chotki/repl/handlers.go so the same
-// clients can target either backend interchangeably:
+// HTTPServer exposes a minimal key/value REST API on top of a Blurry
+// instance, served by Fiber v3:
 //
-//	POST /listen     - body: "host:port"      → start listening
-//	POST /connect    - body: "host:port"      → connect to a peer
-//	POST /class      - body: {Name:S,...}     → create a class
-//	PUT  /name       - body: {Term: ID}       → register a {name → id}
-//	POST /new        - body: {_ref:Class,...} → create an object
-//	PUT  /edit       - body: {_id:ID,...}     → edit an object
-//	GET  /cat?id=ID                            → object as text
-//	GET  /list?id=ID                           → object expanded
+//	GET    /v1/kv/*                                   read raw value
+//	PUT    /v1/kv/*                                   write raw body as value
+//	DELETE /v1/kv/*                                   tombstone the key
+//	GET    /v1/kv?prefix=&keysOnly=                   range scan
+//	PUT    /v1/batch                                  bulk set (one CRDT delta)
+//	GET    /v1/health                                 200 OK
 //
-// All bodies are accepted as plain text in the loose RDX-style mapping
-// format that Chotki's /class etc. handlers expect.
+// "Always batch" — every mutation, even single-key Set/Delete, goes
+// through ds.Batching internally. The /v1/batch endpoint exists so a
+// client that knows it has many writes ahead of it can collapse them
+// into a single CRDT delta + DAG node + pubsub broadcast.
+//
+// Values are raw byte sequences in/out. Keys in the URL path are
+// percent-decoded by Fiber, so "/v1/kv/foo%2Fbar" stores under
+// "foo/bar".
 type HTTPServer struct {
 	b      *Blurry
-	srv    *http.Server
+	app    *fiber.App
 	listen string
 }
 
-// NewHTTPServer wires the handlers to mux but does not start a listener.
-// Use Start to bind to an address.
+// NewHTTPServer wires the routes but does not start a listener.
 func NewHTTPServer(b *Blurry) *HTTPServer {
-	return &HTTPServer{b: b}
+	app := fiber.New(fiber.Config{
+		AppName:           "blurry",
+		ReadBufferSize:    16 * 1024,
+		WriteBufferSize:   16 * 1024,
+		BodyLimit:         64 * 1024 * 1024,
+		DisableKeepalive:  false,
+		StreamRequestBody: true,
+	})
+	h := &HTTPServer{b: b, app: app}
+
+	app.Get("/v1/health", h.handleHealth)
+
+	app.Get("/v1/kv", h.handleList)
+	app.Get("/v1/kv/*", h.handleGet)
+	app.Put("/v1/kv/*", h.handleSet)
+	app.Delete("/v1/kv/*", h.handleDelete)
+
+	app.Put("/v1/batch", h.handleBatch)
+
+	return h
 }
 
-// Start binds and serves the API on addr (e.g. "127.0.0.1:8001"). When
-// Settings.TlsConfig is non-nil the server is upgraded to HTTPS using
-// the certificates in that config.
-//
-// Returns immediately; serving runs in a goroutine. Use Close() to stop.
+// Start binds and serves the API on addr (e.g. "127.0.0.1:8001"). If
+// Settings.TlsConfig has at least one certificate, the listener is
+// wrapped with tls.NewListener so the same code path covers HTTPS.
 func (h *HTTPServer) Start(addr string) error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/listen", withCORS(h.handleListen))
-	mux.HandleFunc("/connect", withCORS(h.handleConnect))
-	mux.HandleFunc("/class", withCORS(h.handleClass))
-	mux.HandleFunc("/name", withCORS(h.handleName))
-	mux.HandleFunc("/new", withCORS(h.handleNew))
-	mux.HandleFunc("/edit", withCORS(h.handleEdit))
-	mux.HandleFunc("/cat", withCORS(h.handleCat))
-	mux.HandleFunc("/list", withCORS(h.handleList))
-
-	h.srv = &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-		TLSConfig:         h.b.settings.TlsConfig,
-	}
 	h.listen = addr
-	useTLS := h.srv.TLSConfig != nil && len(h.srv.TLSConfig.Certificates) > 0
+	tlsCfg := h.b.settings.TlsConfig
+	useTLS := tlsCfg != nil && len(tlsCfg.Certificates) > 0
 	go func() {
 		var err error
 		if useTLS {
-			// Empty cert/key files because the certificates are already
-			// loaded into TLSConfig by the caller (cmd/blurry).
-			err = h.srv.ListenAndServeTLS("", "")
+			ln, lerr := tlsListener(addr, tlsCfg)
+			if lerr != nil {
+				httpLog.Errorf("http: tls listen %s: %v", addr, lerr)
+				return
+			}
+			err = h.app.Listener(ln)
 		} else {
-			err = h.srv.ListenAndServe()
+			err = h.app.Listen(addr)
 		}
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err != nil && !errors.Is(err, fiber.ErrServiceUnavailable) {
 			httpLog.Errorf("http: serve %s: %v", addr, err)
 		}
 	}()
@@ -88,401 +95,113 @@ func (h *HTTPServer) Start(addr string) error {
 	return nil
 }
 
+func tlsListener(addr string, cfg *tls.Config) (net.Listener, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return tls.NewListener(ln, cfg), nil
+}
+
 // Close stops the HTTP server.
 func (h *HTTPServer) Close() error {
-	if h == nil || h.srv == nil {
+	if h == nil || h.app == nil {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return h.srv.Shutdown(ctx)
-}
-
-func withCORS(f http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "*")
-		w.Header().Set("Access-Control-Max-Age", "86400")
-		if r.Method == http.MethodOptions {
-			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS")
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		f(w, r)
-	}
+	return h.app.ShutdownWithContext(ctx)
 }
 
 // ---- handlers ----------------------------------------------------------
 
-func (h *HTTPServer) handleListen(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	body, err := readText(r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if err := h.b.Listen(body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
+func (h *HTTPServer) handleHealth(c fiber.Ctx) error {
+	return c.SendStatus(fiber.StatusOK)
 }
 
-func (h *HTTPServer) handleConnect(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	body, err := readText(r)
+func (h *HTTPServer) handleGet(c fiber.Ctx) error {
+	key, err := keyFromPath(c)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
-	if err := h.b.Connect(r.Context(), body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-}
-
-func (h *HTTPServer) handleClass(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	body, err := readText(r)
+	v, err := h.b.KV().Get(c.Context(), key)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	parent, name, fields, err := parseClassBody(body)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
-		return
-	}
-	// _ref is optional on /class; an absent ref means a top-level class.
-	var parentID ID
-	if parent != "" {
-		parentID, err = h.b.resolveRef(r.Context(), parent)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
+		if errors.Is(err, ErrKeyNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "key not found")
 		}
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 	}
-	id, err := h.b.Store().CreateClass(r.Context(), parentID, name, fields)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(id))
+	c.Set(fiber.HeaderContentType, "application/octet-stream")
+	return c.Send(v)
 }
 
-func (h *HTTPServer) handleName(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPut {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	body, err := readText(r)
+func (h *HTTPServer) handleSet(c fiber.Ctx) error {
+	key, err := keyFromPath(c)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
-	pairs, err := parseMapping(body)
+	body := c.Body()
+	if err := h.b.KV().Set(c.Context(), key, body); err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
+func (h *HTTPServer) handleDelete(c fiber.Ctx) error {
+	key, err := keyFromPath(c)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
-		return
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
 	}
-	for term, ref := range pairs {
-		id, err := h.b.resolveRef(r.Context(), ref)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
+	if err := h.b.KV().Delete(c.Context(), key); err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
+func (h *HTTPServer) handleList(c fiber.Ctx) error {
+	prefix := c.Query("prefix", "")
+	keysOnly := c.Query("keysOnly", "") == "true" || c.Query("keys_only", "") == "true"
+	pairs, err := h.b.KV().List(c.Context(), prefix, keysOnly)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(pairs)
+}
+
+// handleBatch accepts a JSON array of {"key":..., "value":...} pairs
+// and commits them in a single ds.Batch. value is base64-encoded in
+// JSON since it's raw bytes; an empty value is treated as a delete.
+func (h *HTTPServer) handleBatch(c fiber.Ctx) error {
+	var req []batchOp
+	if err := json.Unmarshal(c.Body(), &req); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, fmt.Sprintf("decode body: %v", err))
+	}
+	pairs := make([]KVPair, 0, len(req))
+	for _, op := range req {
+		if op.Key == "" {
+			return fiber.NewError(fiber.StatusBadRequest, "missing key in batch op")
 		}
-		if err := h.b.Store().SetName(r.Context(), term, id); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
+		pairs = append(pairs, KVPair{Key: op.Key, Value: op.Value})
 	}
-	w.WriteHeader(http.StatusOK)
+	if err := h.b.KV().SetBatch(c.Context(), pairs); err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+	}
+	return c.SendStatus(fiber.StatusNoContent)
 }
 
-func (h *HTTPServer) handleNew(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	body, err := readText(r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	ref, values, err := parseRefAndValues(body)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
-		return
-	}
-	classID, err := h.b.resolveRef(r.Context(), ref)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	id, err := h.b.Store().CreateObject(r.Context(), classID, values)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(id))
+type batchOp struct {
+	Key   string `json:"key"`
+	Value []byte `json:"value"`
 }
 
-func (h *HTTPServer) handleEdit(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPut {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+// keyFromPath extracts the application key from a /v1/kv/* route. The
+// wildcard match preserves slashes, so "GET /v1/kv/foo/bar" yields
+// "foo/bar". Returns an error if the key is empty.
+func keyFromPath(c fiber.Ctx) (string, error) {
+	raw := c.Params("*", "")
+	raw = strings.TrimPrefix(raw, "/")
+	if raw == "" {
+		return "", errors.New("empty key")
 	}
-	body, err := readText(r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	id, values, err := parseIDAndValues(body)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
-		return
-	}
-	objID, err := h.b.resolveRef(r.Context(), id)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	out, err := h.b.Store().EditObject(r.Context(), objID, values)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(out))
-}
-
-func (h *HTTPServer) handleCat(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	idStr := r.URL.Query().Get("id")
-	id, err := h.b.resolveRef(r.Context(), idStr)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	o, err := h.b.Store().GetObject(r.Context(), id)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(formatObject(o)))
-}
-
-func (h *HTTPServer) handleList(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	idStr := r.URL.Query().Get("id")
-	id, err := h.b.resolveRef(r.Context(), idStr)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	o, err := h.b.Store().GetObject(r.Context(), id)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
-	}
-	bt, _ := json.MarshalIndent(o, "", "  ")
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(bt)
-}
-
-// ---- helpers -----------------------------------------------------------
-
-func readText(r *http.Request) (string, error) {
-	defer r.Body.Close()
-	bt, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1 MiB cap
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(bt)), nil
-}
-
-// parseMapping parses Chotki-flavoured "{Key:Val, Key2:Val2}" into a
-// flat string→string map. Whitespace and quotes around values are
-// stripped. Reserved keys (those starting with '_') are excluded.
-func parseMapping(s string) (map[string]string, error) {
-	body, err := stripBraces(s)
-	if err != nil {
-		return nil, err
-	}
-	out := map[string]string{}
-	for _, kv := range splitTopLevel(body, ',') {
-		kv = strings.TrimSpace(kv)
-		if kv == "" {
-			continue
-		}
-		i := strings.IndexByte(kv, ':')
-		if i < 0 {
-			return nil, fmt.Errorf("bad pair %q", kv)
-		}
-		k := strings.TrimSpace(kv[:i])
-		v := unquote(strings.TrimSpace(kv[i+1:]))
-		if k == "" {
-			return nil, fmt.Errorf("empty key in %q", kv)
-		}
-		out[k] = v
-	}
-	return out, nil
-}
-
-// parseClassBody parses "{_ref: Parent, Name: S, Score: N}" → parent, name, fields.
-func parseClassBody(s string) (parent string, name string, fields []FieldSpec, err error) {
-	m, err := parseMapping(s)
-	if err != nil {
-		return "", "", nil, err
-	}
-	parent = m["_ref"]
-	name = m["Name"]
-
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	for _, k := range keys {
-		if strings.HasPrefix(k, "_") {
-			continue
-		}
-		v := m[k]
-		if k == "Name" && (v == "S" || v == "") {
-			// Treat the special "Name:S" pair as both class name + first field.
-			fields = append(fields, FieldSpec{Name: k, Kind: FieldString})
-			continue
-		}
-		if len(v) != 1 {
-			return "", "", nil, fmt.Errorf("field %q must have a single-letter RDT, got %q", k, v)
-		}
-		fields = append(fields, FieldSpec{Name: k, Kind: FieldKind(v[0])})
-	}
-	return
-}
-
-// parseRefAndValues parses {_ref:X, A:1, B:"foo"} → ref, {A:"1", B:"foo"}.
-func parseRefAndValues(s string) (ref string, values map[string]string, err error) {
-	m, err := parseMapping(s)
-	if err != nil {
-		return "", nil, err
-	}
-	ref = m["_ref"]
-	if ref == "" {
-		return "", nil, fmt.Errorf("missing _ref")
-	}
-	values = map[string]string{}
-	for k, v := range m {
-		if strings.HasPrefix(k, "_") {
-			continue
-		}
-		values[k] = v
-	}
-	return
-}
-
-// parseIDAndValues parses {_id:X, A:1} → id, {A:"1"}.
-func parseIDAndValues(s string) (id string, values map[string]string, err error) {
-	m, err := parseMapping(s)
-	if err != nil {
-		return "", nil, err
-	}
-	id = m["_id"]
-	if id == "" {
-		// Chotki's edit also accepts _ref as alias.
-		id = m["_ref"]
-	}
-	if id == "" {
-		return "", nil, fmt.Errorf("missing _id")
-	}
-	values = map[string]string{}
-	for k, v := range m {
-		if strings.HasPrefix(k, "_") {
-			continue
-		}
-		values[k] = v
-	}
-	return
-}
-
-func stripBraces(s string) (string, error) {
-	s = strings.TrimSpace(s)
-	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
-		return "", fmt.Errorf("expected mapping {...}, got %q", s)
-	}
-	return s[1 : len(s)-1], nil
-}
-
-// splitTopLevel splits by `sep` while respecting nested {} [] and quotes.
-func splitTopLevel(s string, sep byte) []string {
-	var out []string
-	depth := 0
-	inStr := false
-	last := 0
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c == '"' && (i == 0 || s[i-1] != '\\'):
-			inStr = !inStr
-		case !inStr && (c == '{' || c == '['):
-			depth++
-		case !inStr && (c == '}' || c == ']'):
-			depth--
-		case !inStr && c == sep && depth == 0:
-			out = append(out, s[last:i])
-			last = i + 1
-		}
-	}
-	out = append(out, s[last:])
-	return out
-}
-
-func unquote(s string) string {
-	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		return s[1 : len(s)-1]
-	}
-	return s
-}
-
-func formatObject(o *Object) string {
-	keys := make([]string, 0, len(o.Fields))
-	for k := range o.Fields {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var b strings.Builder
-	b.WriteByte('{')
-	for i, k := range keys {
-		if i > 0 {
-			b.WriteByte(',')
-		}
-		b.WriteString(k)
-		b.WriteByte(':')
-		b.WriteString(o.Fields[k])
-	}
-	b.WriteByte('}')
-	return b.String()
+	return raw, nil
 }

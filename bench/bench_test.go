@@ -1,12 +1,14 @@
-// Bench harness: writes a stream of sequentially-numbered objects
-// (each carrying a fixed-size Payload) to the first replica of a
+// Bench harness: writes a stream of sequentially-numbered values
+// (each carrying a fixed-size payload) to the first replica of a
 // stack, reads them back from the third replica, and reports the
 // wall-clock time the cluster needed to process the data.
 //
-// Two stacks are exercised back-to-back: first the Blurry compose
-// file, then the Chotki one. Each subtest brings its own compose
-// stack up (`docker compose -f ... up -d --build --wait`) and tears
-// it down afterwards.
+// Two stacks are exercised back-to-back. They speak different APIs
+// because Blurry is now a pure key/value store while Chotki keeps
+// its class/object/field surface; per-stack hooks on stackCfg take
+// care of the difference. The replication mechanics under each API
+// are still directly comparable — sequential writes on replica 1,
+// poll reads on replica 3, fixed payload size.
 //
 // Default load is light enough to run on a laptop (1000 × 64 KiB ≈
 // 64 MiB end-to-end). Bump it via env vars when you want to push
@@ -29,10 +31,13 @@ package bench
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -44,12 +49,7 @@ import (
 	"time"
 )
 
-// Bench load knobs. Defaults stay light enough to run on a laptop
-// without OOM-killing the host (1000 × 64 KiB ≈ 64 MiB end-to-end).
-// Override at the command line for heavier or lighter runs:
-//
-//	BENCH_REQUESTS=5000 BENCH_PAYLOAD_SIZE=131072 \
-//	  go test -timeout=2h -run TestBench .
+// Bench load knobs.
 const (
 	defaultNumRequests     = 1000
 	defaultPayloadSize     = 64 * 1024
@@ -94,49 +94,79 @@ func envDuration(key string, def time.Duration) time.Duration {
 
 type stackCfg struct {
 	name     string
-	project  string // docker compose project name (isolates resources between stacks)
+	project  string
 	compose  string
-	writeURL string // base URL of "first" replica
-	readURL  string // base URL of "third" replica
+	writeURL string
+	readURL  string
 
-	// classBody is the body sent to POST /class to create the bench
-	// schema. Both stacks must end up storing two fields whose names
-	// are exactly "Seq" and "Payload": chotki's repl encodes class
-	// fields as <RDT><name> while ParseClass expects <RDT><Index><name>,
-	// so on chotki we prepend a one-byte padding char to each field
-	// name to compensate. Both stacks then accept identical /new and
-	// /cat traffic.
-	classBody string
+	// healthPath probes "is HTTP up". Stack-specific: blurry exposes
+	// /v1/health, chotki only has /cat.
+	healthPath string
+
+	// setup is called once per run on the write replica before any
+	// writes. It can return an opaque "schema id" the writer needs
+	// (Chotki returns its class id, Blurry returns "").
+	setup func(ctx context.Context, base string) (string, error)
+
+	// write performs one application-level write. Returns the id the
+	// reader should query to retrieve the value.
+	write func(ctx context.Context, base, schemaID string, seq int, payload []byte) (string, error)
+
+	// read fetches the body for id from the read replica.
+	read func(ctx context.Context, base, id string) ([]byte, error)
+
+	// verify validates that the body returned by read corresponds to
+	// (seq, payload). Implementation depends on whether the body is
+	// raw bytes (Blurry) or a wrapped object representation (Chotki).
+	verify func(seq int, body, payload []byte) error
 }
 
 var stacks = []stackCfg{
 	{
-		name:      "blurry",
-		project:   "bench-blurry",
-		compose:   "docker-compose.blurry.yml",
-		writeURL:  "http://127.0.0.1:8001",
-		readURL:   "http://127.0.0.1:8003",
-		classBody: "{Seq: I, Payload: S}",
+		name:       "blurry",
+		project:    "bench-blurry",
+		compose:    "docker-compose.blurry.yml",
+		writeURL:   "http://127.0.0.1:8001",
+		readURL:    "http://127.0.0.1:8003",
+		healthPath: "/v1/health",
+		setup:      blurrySetup,
+		write:      blurryWrite,
+		read:       blurryRead,
+		verify:     blurryVerify,
 	},
 	{
-		name:      "chotki",
-		project:   "bench-chotki",
-		compose:   "docker-compose.chotki.yml",
-		writeURL:  "http://127.0.0.1:9001",
-		readURL:   "http://127.0.0.1:9003",
-		classBody: "{XSeq: I, XPayload: S}",
+		name:       "chotki",
+		project:    "bench-chotki",
+		compose:    "docker-compose.chotki.yml",
+		writeURL:   "http://127.0.0.1:9001",
+		readURL:    "http://127.0.0.1:9003",
+		healthPath: "/cat?id=ping",
+		setup:      chotkiSetup,
+		write:      chotkiWrite,
+		read:       chotkiRead,
+		verify:     chotkiVerify,
 	},
 }
 
 // payloadFiller is the static body shared by every request: allocated
-// once at package init and never mutated. Each /new body is built by
-// writing a 15-byte per-seq header into a reusable scratch buffer and
-// then appending the suffix of payloadFiller, so we don't burn one
-// allocation × payloadSize per request through GC.
+// once at package init and never mutated. Each write builds a
+// per-seq payload by stamping the 15-byte header into a copy.
 var payloadFiller = bytes.Repeat([]byte{'a'}, payloadSize)
 
 const payloadHeaderFmt = "SEQ=%010d:" // 15 bytes
 const payloadHeaderLen = 15
+
+// payloadFor returns a 256 KiB-sized body whose first 15 bytes encode
+// `seq` and the rest are 'a'. Reuses payloadFiller for the suffix; a
+// fresh buffer is allocated only for the seq header bytes since the
+// HTTP body needs a stable view across the request lifetime.
+func payloadFor(seq int) []byte {
+	out := make([]byte, payloadSize)
+	header := fmt.Sprintf(payloadHeaderFmt, seq)
+	copy(out, header)
+	copy(out[len(header):], payloadFiller[len(header):])
+	return out
+}
 
 // TestMain installs a signal handler that tears both compose stacks
 // down on SIGINT/SIGTERM. t.Cleanup hooks fire on test failures but
@@ -194,9 +224,6 @@ func runBench(t *testing.T, s stackCfg) {
 	}
 
 	t.Logf("[%s] bringing stack up via %s (project=%s)", s.name, composePath, s.project)
-	// Register the teardown before bringing the stack up so a failed
-	// `up` (which can leave partially-created networks/volumes/containers
-	// behind) still gets cleaned out.
 	dumpLogs := func(reason string) {
 		out, lerr := runCmd(time.Minute,
 			"docker", "compose", "--project-name", s.project, "-f", composePath,
@@ -215,12 +242,6 @@ func runBench(t *testing.T, s stackCfg) {
 			t.Logf("[%s] docker compose down: %v\n%s", s.name, derr, out)
 		}
 	})
-	// Wipe any leftover state from a previously interrupted run before
-	// `up`. If a prior invocation got SIGKILLed (kernel OOM, kill -9)
-	// its t.Cleanup never fired and the named volumes still hold old
-	// CRDT objects whose ids collide with what this run will mint
-	// (Blurry's MintID counter restarts at 0 each process), making
-	// /cat return stale data instead of what we just wrote.
 	if out, err := runCmd(2*time.Minute,
 		"docker", "compose", "--project-name", s.project, "-f", composePath,
 		"down", "-v", "--remove-orphans"); err != nil {
@@ -239,18 +260,23 @@ func runBench(t *testing.T, s stackCfg) {
 		}
 	})
 
-	if err := waitReady(s.writeURL, 2*time.Minute); err != nil {
+	if err := waitReady(s.writeURL+s.healthPath, 2*time.Minute); err != nil {
 		t.Fatalf("[%s] write replica not ready: %v", s.name, err)
 	}
-	if err := waitReady(s.readURL, 2*time.Minute); err != nil {
+	if err := waitReady(s.readURL+s.healthPath, 2*time.Minute); err != nil {
 		t.Fatalf("[%s] read replica not ready: %v", s.name, err)
 	}
 
-	classID, err := createClass(s.writeURL, s.classBody)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	schemaID, err := s.setup(ctx, s.writeURL)
 	if err != nil {
-		t.Fatalf("[%s] create class: %v", s.name, err)
+		t.Fatalf("[%s] setup: %v", s.name, err)
 	}
-	t.Logf("[%s] class id: %s", s.name, classID)
+	if schemaID != "" {
+		t.Logf("[%s] schema id: %s", s.name, schemaID)
+	}
 
 	type pair struct {
 		seq int
@@ -259,9 +285,6 @@ func runBench(t *testing.T, s stackCfg) {
 
 	ch := make(chan pair, 256)
 	writeErr := make(chan error, 1)
-	// done is closed when the reader gives up (verification failure or
-	// premature exit) so the writer goroutine can stop instead of
-	// blocking on `ch <- pair` against a torn-down stack.
 	done := make(chan struct{})
 	defer close(done)
 
@@ -269,7 +292,6 @@ func runBench(t *testing.T, s stackCfg) {
 
 	go func() {
 		defer close(ch)
-		bodyBuf := bytes.NewBuffer(make([]byte, 0, payloadSize+128))
 		for seq := 0; seq < numRequests; seq++ {
 			select {
 			case <-done:
@@ -277,7 +299,7 @@ func runBench(t *testing.T, s stackCfg) {
 				return
 			default:
 			}
-			id, err := postNew(s.writeURL, classID, seq, bodyBuf)
+			id, err := s.write(ctx, s.writeURL, schemaID, seq, payloadFor(seq))
 			if err != nil {
 				writeErr <- fmt.Errorf("write seq=%d: %w", seq, err)
 				return
@@ -296,7 +318,7 @@ func runBench(t *testing.T, s stackCfg) {
 	var verifyErr error
 	for p := range ch {
 		deadline := time.Now().Add(perReadDeadline)
-		if err := pollAndVerify(s.readURL, p.id, p.seq, deadline); err != nil {
+		if err := pollAndVerify(ctx, s, p.seq, p.id, deadline); err != nil {
 			verifyErr = fmt.Errorf("read seq=%d id=%s: %w", p.seq, p.id, err)
 			break
 		}
@@ -321,133 +343,203 @@ func runBench(t *testing.T, s stackCfg) {
 		float64(numRequests*payloadSize)/(1024*1024)/elapsed.Seconds())
 }
 
-// ---- HTTP helpers -----------------------------------------------------
+// ---- HTTP infrastructure ----------------------------------------------
 
 var httpClient = &http.Client{Timeout: httpReqTimeout}
 
-func waitReady(base string, timeout time.Duration) error {
+func waitReady(probeURL string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		resp, err := httpClient.Get(base + "/cat?id=ping")
-		// http.Get can return a non-nil resp alongside a non-nil err
-		// (redirect failures, etc.) — drain & close in either case.
+		resp, err := httpClient.Get(probeURL)
 		if resp != nil {
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 		}
-		// Any non-5xx status means the HTTP server is up and
-		// answering; we tolerate 4xx because /cat?id=ping is an
-		// intentionally invalid request used as a probe.
 		if err == nil && resp != nil && resp.StatusCode > 0 && resp.StatusCode < 500 {
 			return nil
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	return fmt.Errorf("not ready within %s", timeout)
+	return fmt.Errorf("not ready within %s: %s", timeout, probeURL)
 }
 
-func createClass(base, body string) (string, error) {
-	resp, err := httpClient.Post(base+"/class", "text/plain", strings.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	bt, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("status %d: %s", resp.StatusCode, bt)
-	}
-	id := strings.TrimSpace(string(bt))
-	if id == "" {
-		return "", errors.New("empty class id in response")
-	}
-	return id, nil
-}
-
-// postNew reuses a single bytes.Buffer per goroutine, avoiding a fresh
-// 256 KiB allocation per request.
-func postNew(base, classID string, seq int, buf *bytes.Buffer) (string, error) {
-	buf.Reset()
-	buf.WriteString("{_ref: ")
-	buf.WriteString(classID)
-	buf.WriteString(", Seq: ")
-	buf.WriteString(strconv.Itoa(seq))
-	buf.WriteString(`, Payload: "`)
-	fmt.Fprintf(buf, payloadHeaderFmt, seq)
-	buf.Write(payloadFiller[payloadHeaderLen:])
-	buf.WriteString(`"}`)
-
-	resp, err := httpClient.Post(base+"/new", "text/plain", bytes.NewReader(buf.Bytes()))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	bt, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("status %d: %s", resp.StatusCode, bt)
-	}
-	id := strings.TrimSpace(string(bt))
-	if id == "" {
-		return "", errors.New("empty object id in response")
-	}
-	return id, nil
-}
-
-func pollAndVerify(base, id string, seq int, deadline time.Time) error {
-	url := base + "/cat?id=" + id
+func pollAndVerify(ctx context.Context, s stackCfg, seq int, id string, deadline time.Time) error {
+	expected := payloadFor(seq)
 	for {
-		resp, err := httpClient.Get(url)
-		// http.Get can return a non-nil resp alongside a non-nil err
-		// (redirect failures, etc.) — read & close in either case so
-		// the keep-alive pool doesn't leak idle connections.
-		var (
-			body   []byte
-			status string
-		)
-		if resp != nil {
-			body, _ = io.ReadAll(resp.Body)
-			resp.Body.Close()
-			status = resp.Status
-		}
-		if err == nil && resp != nil && resp.StatusCode == http.StatusOK {
-			if verr := verifyResponse(body, seq); verr != nil {
+		body, err := s.read(ctx, s.readURL, id)
+		if err == nil {
+			if verr := s.verify(seq, body, expected); verr != nil {
 				return verr
 			}
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timeout waiting for sync; last status=%q err=%v", status, err)
+			return fmt.Errorf("timeout waiting for sync; last err=%v", err)
 		}
 		time.Sleep(pollInterval)
 	}
 }
 
-// verifyResponse extracts the Payload field from a /cat response body
-// and checks every byte of it matches what postNew sent for `seq`. It
-// also checks the Seq scalar field round-tripped intact.
-//
-// Both stacks return text approximating
-//
-//	{Payload:<value>,Seq:N}                (Blurry: keys sorted, no quotes)
-//	{_ref:0-0,Seq:N,Payload:"<value>"}     (Chotki: ObjectString form)
-//
-// so we accept either quoted or unquoted Payload values.
-func verifyResponse(body []byte, seq int) error {
+// ---- Blurry KV adapter ------------------------------------------------
+
+func blurryKey(seq int) string {
+	return fmt.Sprintf("bench/%010d", seq)
+}
+
+func blurrySetup(ctx context.Context, base string) (string, error) {
+	return "", nil
+}
+
+// blurryWrite issues a single-key PUT /v1/batch with the seq's
+// key/value pair. Going through /v1/batch (rather than the simpler
+// /v1/kv/:key) exercises the same Batch.Commit path the docs cite as
+// the "400 keys/s with batching" baseline, even when each request
+// happens to carry one key.
+func blurryWrite(ctx context.Context, base, _ string, seq int, payload []byte) (string, error) {
+	key := blurryKey(seq)
+	body, err := json.Marshal([]struct {
+		Key   string `json:"key"`
+		Value []byte `json:"value"`
+	}{{Key: key, Value: payload}})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, base+"/v1/batch", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	bt, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode/100 != 2 {
+		return "", fmt.Errorf("status %d: %s", resp.StatusCode, bt)
+	}
+	return key, nil
+}
+
+func blurryRead(ctx context.Context, base, id string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		base+"/v1/kv/"+url.PathEscape(id), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	bt, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, errors.New("not found")
+	}
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, bt)
+	}
+	return bt, nil
+}
+
+func blurryVerify(seq int, body, expected []byte) error {
+	if !bytes.Equal(body, expected) {
+		return fmt.Errorf("body mismatch (got len=%d, want len=%d)", len(body), len(expected))
+	}
+	return nil
+}
+
+// ---- Chotki classic adapter ------------------------------------------
+
+const chotkiClassBody = "{XSeq: I, XPayload: S}"
+
+// chotkiSetup creates a class with two fields. The X-prefix workaround
+// compensates for chotki's repl class encoding bug (it stores
+// <RDT><name> while ParseClass reads <RDT><Index><name>, so the
+// leading byte of every field name is eaten on read).
+func chotkiSetup(ctx context.Context, base string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		base+"/class", strings.NewReader(chotkiClassBody))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "text/plain")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	bt, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("status %d: %s", resp.StatusCode, bt)
+	}
+	id := strings.TrimSpace(string(bt))
+	if id == "" {
+		return "", errors.New("empty class id")
+	}
+	return id, nil
+}
+
+func chotkiWrite(ctx context.Context, base, classID string, seq int, payload []byte) (string, error) {
+	var buf bytes.Buffer
+	buf.Grow(len(payload) + 128)
+	buf.WriteString("{_ref: ")
+	buf.WriteString(classID)
+	buf.WriteString(", Seq: ")
+	buf.WriteString(strconv.Itoa(seq))
+	buf.WriteString(`, Payload: "`)
+	buf.Write(payload)
+	buf.WriteString(`"}`)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		base+"/new", bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "text/plain")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	bt, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("status %d: %s", resp.StatusCode, bt)
+	}
+	id := strings.TrimSpace(string(bt))
+	if id == "" {
+		return "", errors.New("empty object id")
+	}
+	return id, nil
+}
+
+func chotkiRead(ctx context.Context, base, id string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		base+"/cat?id="+url.QueryEscape(id), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	bt, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, bt)
+	}
+	return bt, nil
+}
+
+func chotkiVerify(seq int, body, expected []byte) error {
 	payload, err := extractField(body, "Payload")
 	if err != nil {
 		return fmt.Errorf("extract Payload: %w (body len=%d)", err, len(body))
 	}
-	if len(payload) != payloadSize {
-		return fmt.Errorf("Payload len %d != expected %d", len(payload), payloadSize)
+	if !bytes.Equal(payload, expected) {
+		return fmt.Errorf("Payload bytes mismatch (got len=%d, want len=%d)",
+			len(payload), len(expected))
 	}
-	wantHeader := fmt.Sprintf(payloadHeaderFmt, seq)
-	if !bytes.Equal(payload[:payloadHeaderLen], []byte(wantHeader)) {
-		return fmt.Errorf("Payload header %q != expected %q",
-			payload[:payloadHeaderLen], wantHeader)
-	}
-	if !bytes.Equal(payload[payloadHeaderLen:], payloadFiller[payloadHeaderLen:]) {
-		return errors.New("Payload filler bytes mismatch")
-	}
-
 	seqField, err := extractField(body, "Seq")
 	if err != nil {
 		return fmt.Errorf("extract Seq: %w", err)
@@ -459,13 +551,17 @@ func verifyResponse(body []byte, seq int) error {
 	if gotSeq != seq {
 		return fmt.Errorf("Seq %d != expected %d", gotSeq, seq)
 	}
+	if !bytes.HasPrefix(payload, []byte(fmt.Sprintf(payloadHeaderFmt, seq))) {
+		return fmt.Errorf("Payload header mismatch (first %d bytes %q)",
+			payloadHeaderLen, payload[:payloadHeaderLen])
+	}
 	return nil
 }
 
 // extractField finds the value associated with `name:` in a flat
-// `{a:1,b:2,c:"3"}` style mapping. It strips one layer of surrounding
-// double quotes if present, and otherwise returns everything up to the
-// next `,` or `}`.
+// `{a:1,b:2,c:"3"}` style mapping. Strips one layer of surrounding
+// double quotes, otherwise returns everything up to the next `,` or
+// `}`.
 func extractField(body []byte, name string) ([]byte, error) {
 	needle := []byte(name + ":")
 	i := bytes.Index(body, needle)
@@ -487,6 +583,8 @@ func extractField(body []byte, name string) ([]byte, error) {
 	}
 	return val[:end], nil
 }
+
+// ---- subprocess helper ------------------------------------------------
 
 func runCmd(timeout time.Duration, name string, args ...string) ([]byte, error) {
 	cmd := exec.Command(name, args...)

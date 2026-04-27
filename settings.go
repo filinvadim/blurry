@@ -12,48 +12,41 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 )
 
-// Settings is the unified configuration for a Blurry replica.
-//
-// The fields below intentionally mirror github.com/drpcorg/chotki.Options
-// (which itself embeds chotki.ClusterConfig in the matching commit on
-// the Chotki side) so the same deployment descriptor can drive both
-// backends. Fields that have no behavioural effect on the libp2p stack
-// are still honoured wherever possible (e.g. broadcast queue limits
-// translate to gossip parameters).
+// Settings is the unified configuration for a Blurry replica. After
+// the v0.x → KV refactor this struct only carries fields Blurry's
+// runtime actually consumes: libp2p host options, the connection
+// manager, the go-ds-crdt knobs, badger sync mode, and TLS. The
+// chotki-parity timing/sizing block (BroadcastQueue*, ReadAccum*,
+// PingPeriod, …) and the chotki-bridge fields (ChotkiPeer,
+// ChotkiMirrorClass, ChotkiClassID) live in legacy/chotki/ now.
 type Settings struct {
-	// ---- identity ----------------------------------------------------
+	// ---- identity ---------------------------------------------------
 	//
-	// A single Name is the canonical identifier for this replica.
-	// Everything stable-identity-related is derived from it:
+	// A single Name is the canonical identifier for this replica:
 	//   * the libp2p peer id (Ed25519 key seeded by Name)
 	//   * the chotki-style 32-bit Src (sha256(Name) → uint32 space)
-	//   * the Store's id-prefix
 	//   * the Y record on first boot
 	//
 	// Two replicas booted with the same Name are the same logical node.
 	// PrivateKey is a programmatic override (used in tests / embedded
 	// deployments where the caller already owns a key); when set it
-	// wins over Name for the libp2p identity but Src/Name still drive
-	// chotki-side bookkeeping.
+	// wins over Name for the libp2p identity.
 	Name       string
 	PrivateKey crypto.PrivKey
 
-	// ---- libp2p network ---------------------------------------------
+	// ---- libp2p network --------------------------------------------
 
 	// Local listen endpoint.
 	ListenHost string // "0.0.0.0", "::", or a specific address
 	ListenPort int    // e.g. 4001
 
-	// HTTP API port (Chotki-compatible).
+	// HTTP API endpoint (KV REST surface).
 	HTTPHost string
 	HTTPPort int
 
 	// ClusterPeers contains addresses of other replicas to connect to
-	// at start. Each entry can be:
-	//   - a libp2p multiaddr ("/ip4/1.2.3.4/tcp/4001/p2p/<peerID>")
-	//   - a libp2p AddrInfo string ("/ip4/.../p2p/<peerID>")
-	//   - a plain "host:port" pair (resolved to /ip4/host/tcp/port)
-	//   - a bare IP (uses the same TCP port as ListenPort)
+	// at start. Each entry can be a libp2p multiaddr, a libp2p
+	// AddrInfo string, a plain "host:port" pair, or a bare IP.
 	ClusterPeers []string
 
 	// PrivateNetworkPSK enables a libp2p private-net pre-shared key.
@@ -77,72 +70,26 @@ type Settings struct {
 	ConnHighWater   int
 	ConnGracePeriod time.Duration
 
-	// ---- chotki.Options parity --------------------------------------
-	//
-	// These fields are accepted as-is from a chotki.Options-shaped
-	// descriptor. They influence Blurry's gossip and libp2p layers
-	// where there is a sensible mapping; otherwise they are stored on
-	// the Settings struct so the same config can round-trip.
-
-	PingPeriod time.Duration
-	PingWait   time.Duration
-
-	BroadcastQueueMaxSize      int
-	BroadcastQueueMinBatchSize int
-	BroadcastQueueTimeLimit    time.Duration
-
-	ReadAccumTimeLimit         time.Duration
-	ReadMaxBufferSize          int
-	ReadMinBufferSizeToProcess int
-
-	TcpReadBufferSize  int
-	TcpWriteBufferSize int
-
-	WriteTimeout    time.Duration
-	MaxSyncDuration time.Duration
-
-	// TlsConfig optionally enables a libp2p TLS transport (chotki uses
-	// the same field for its tcp+tls listener).
+	// TlsConfig optionally enables TLS for the HTTP API.
 	TlsConfig *tls.Config
 
-	// ---- storage / CRDT ---------------------------------------------
+	// ---- storage / CRDT --------------------------------------------
 
 	// Datastore is the badger options blob; nil → DefaultOptions.
 	Datastore *Options
 
-	// VersionPrefix namespaces the CRDT keys under a sub-tree (chotki
-	// has no equivalent; default empty).
+	// VersionPrefix namespaces the CRDT keys under a sub-tree.
 	VersionPrefix       string
 	RebroadcastInterval time.Duration
 	DAGSyncerTimeout    time.Duration
 
-	// SyncWrites toggles badger fsync-on-commit. Mirrors chotki's
-	// pebble.WriteOptions{Sync:true} default for ACID durability.
+	// SyncWrites toggles badger fsync-on-commit.
 	SyncWrites bool
-
-	// ---- chotki bridge (PoC) ----------------------------------------
-	//
-	// When ChotkiPeer is non-empty, blurry connects to that chotki TCP
-	// listener using chotki's wire protocol and bidirectionally mirrors
-	// objects of ChotkiMirrorClass between the two stores. See
-	// chotki_bridge.go for limitations.
-
-	// ChotkiPeer is the "host:port" or "tcp://host:port" of a chotki
-	// replica to bridge to. Empty disables the bridge.
-	ChotkiPeer string
-
-	// ChotkiMirrorClass is the local Blurry class name created/used to
-	// mirror chotki objects. Default: "ChotkiMirror".
-	ChotkiMirrorClass string
-
-	// ChotkiClassID is the chotki rdx.ID of the equivalent class on
-	// the chotki side (e.g. "1f-2"). Required when ChotkiPeer is set.
-	ChotkiClassID string
 }
 
-// DefaultSettings returns sensible defaults aligned with chotki's
-// SetDefaults() in chotki.go. Boolean toggles default to "on" so a
-// fresh Blurry node can discover and dial peers without further wiring.
+// DefaultSettings returns sensible defaults. Boolean toggles default
+// to "on" so a fresh Blurry node can discover and dial peers without
+// further wiring.
 func DefaultSettings() *Settings {
 	s := &Settings{
 		ListenHost:         "0.0.0.0",
@@ -163,10 +110,10 @@ func DefaultSettings() *Settings {
 	return s
 }
 
-// SetDefaults fills numeric/duration zero values with the same defaults
-// chotki.Options.SetDefaults uses. Boolean toggles are intentionally
-// left alone (they default to their zero value when the struct is
-// constructed manually; use DefaultSettings() for toggles-on defaults).
+// SetDefaults fills numeric/duration zero values. Boolean toggles are
+// intentionally left alone (they default to their zero value when the
+// struct is constructed manually; use DefaultSettings() for toggles-on
+// defaults).
 func (s *Settings) SetDefaults() {
 	if s == nil {
 		return
@@ -180,33 +127,6 @@ func (s *Settings) SetDefaults() {
 	if s.ConnGracePeriod == 0 {
 		s.ConnGracePeriod = time.Hour
 	}
-	if s.PingPeriod == 0 {
-		s.PingPeriod = 30 * time.Second
-	}
-	if s.PingWait == 0 {
-		s.PingWait = 10 * time.Second
-	}
-	if s.ReadMaxBufferSize == 0 {
-		s.ReadMaxBufferSize = 1024 * 1024 * 1000 // 1000MB
-	}
-	if s.ReadMinBufferSizeToProcess == 0 {
-		s.ReadMinBufferSizeToProcess = 10 * 1024 // 10kb
-	}
-	if s.BroadcastQueueTimeLimit == 0 {
-		s.BroadcastQueueTimeLimit = time.Second
-	}
-	if s.BroadcastQueueMaxSize == 0 {
-		s.BroadcastQueueMaxSize = 10 * 1024 * 1024 // 10MB
-	}
-	if s.ReadAccumTimeLimit == 0 {
-		s.ReadAccumTimeLimit = 5 * time.Second
-	}
-	if s.WriteTimeout == 0 {
-		s.WriteTimeout = 5 * time.Minute
-	}
-	if s.MaxSyncDuration == 0 {
-		s.MaxSyncDuration = 10 * time.Minute
-	}
 	if s.RebroadcastInterval == 0 {
 		s.RebroadcastInterval = time.Minute
 	}
@@ -215,8 +135,7 @@ func (s *Settings) SetDefaults() {
 	}
 }
 
-// Validate normalizes and checks the settings, returning an error on
-// invalid combinations. Safe to call multiple times.
+// Validate normalizes and checks the settings.
 func (s *Settings) Validate() error {
 	if s == nil {
 		return errors.New("settings: nil")
@@ -240,13 +159,12 @@ func (s *Settings) Validate() error {
 	return nil
 }
 
-// MaxSrc bounds derived Source values to chotki's 32-bit Source space
-// (chotki/rdx.MaxSrc).
+// MaxSrc bounds derived Source values to a 32-bit Source space.
 const MaxSrc = uint64(1<<32 - 1)
 
-// Src returns the chotki-style 32-bit replica id derived from Name.
-// Two replicas configured with the same Name share the same Src; an
-// empty Name returns 0.
+// Src returns a 32-bit replica id derived from Name. Two replicas
+// configured with the same Name share the same Src; an empty Name
+// returns 0.
 func (s *Settings) Src() uint64 {
 	if s == nil || s.Name == "" {
 		return 0
@@ -268,7 +186,6 @@ func (s *Settings) IdentityKey() (crypto.PrivKey, error) {
 		return s.PrivateKey, nil
 	}
 	if s.Name != "" {
-		// Hash Name down to ed25519's required 32-byte seed size.
 		sum := sha256.Sum256([]byte(s.Name))
 		seed := sum[:ed25519.SeedSize]
 		edPriv := ed25519.NewKeyFromSeed(seed)
