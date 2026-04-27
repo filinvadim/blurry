@@ -19,17 +19,23 @@ ENV CGO_ENABLED=0 GOFLAGS=-mod=vendor
 RUN --mount=type=cache,target=/root/.cache/go-build \
     go build -trimpath -ldflags="-s -w" -o /out/blurry ./cmd/blurry
 
+# Pre-create the data dir with nonroot ownership in the build stage so
+# the runtime image already has a /tmp/blurry owned by uid 65532. When
+# docker (or compose) mounts a fresh named volume at this path, it
+# initializes the volume from the existing image directory and inherits
+# its perms — without this, the volume defaults to root:root and the
+# distroless nonroot user can't write to it.
+RUN install -d -o 65532 -g 65532 /var/empty/blurry-data
+
 # ---- runtime ----------------------------------------------------------
 FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=build /out/blurry /usr/local/bin/blurry
+COPY --from=build --chown=nonroot:nonroot /var/empty/blurry-data /tmp/blurry
 
 # libp2p (TCP) and HTTP API.
 EXPOSE 4001 8001
 
-# Live under /tmp so the distroless `nonroot` user can write without
-# extra ownership gymnastics — /tmp is world-writable and named
-# volumes mounted there inherit perms the user can use.
 VOLUME ["/tmp/blurry"]
 
 ENV BLURRY_DATA_DIR=/tmp/blurry \
