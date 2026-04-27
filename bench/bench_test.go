@@ -1,12 +1,21 @@
-// Bench harness: writes 30000 sequentially-numbered objects (each
-// carrying a 256 KiB Payload) to the first replica of a stack, reads
-// them back from the third replica, and reports the wall-clock time
-// the cluster needed to process the data.
+// Bench harness: writes a stream of sequentially-numbered objects
+// (each carrying a fixed-size Payload) to the first replica of a
+// stack, reads them back from the third replica, and reports the
+// wall-clock time the cluster needed to process the data.
 //
-// Two stacks are exercised back-to-back: first the Blurry compose file,
-// then the Chotki one. Each subtest brings its own compose stack up
-// (`docker compose -f ... up -d --build --wait`) and tears it down
-// afterwards.
+// Two stacks are exercised back-to-back: first the Blurry compose
+// file, then the Chotki one. Each subtest brings its own compose
+// stack up (`docker compose -f ... up -d --build --wait`) and tears
+// it down afterwards.
+//
+// Default load is light enough to run on a laptop (1000 × 64 KiB ≈
+// 64 MiB end-to-end). Bump it via env vars when you want to push
+// harder:
+//
+//	BENCH_REQUESTS=5000 \
+//	BENCH_PAYLOAD_SIZE=131072 \
+//	BENCH_PER_READ_TIMEOUT=2m \
+//	  go test -timeout=2h -run TestBench .
 //
 // Usage (the bench/ directory is its own Go module, so cd into it):
 //
@@ -14,7 +23,8 @@
 //	go test -timeout=2h -run TestBench .
 //
 // The test is skipped when `docker` is not on $PATH or when run with
-// `-short`.
+// `-short`. SIGINT/SIGTERM trigger a best-effort `docker compose
+// down -v` for both stacks before exit.
 package bench
 
 import (
@@ -25,21 +35,62 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
 
+// Bench load knobs. Defaults stay light enough to run on a laptop
+// without OOM-killing the host (1000 × 64 KiB ≈ 64 MiB end-to-end).
+// Override at the command line for heavier or lighter runs:
+//
+//	BENCH_REQUESTS=5000 BENCH_PAYLOAD_SIZE=131072 \
+//	  go test -timeout=2h -run TestBench .
 const (
-	numRequests     = 30000
-	payloadSize     = 256 * 1024
-	composeUpWait   = 5 * time.Minute
-	httpReqTimeout  = 2 * time.Minute
-	pollInterval    = 50 * time.Millisecond
-	perReadDeadline = 5 * time.Minute
+	defaultNumRequests     = 1000
+	defaultPayloadSize     = 64 * 1024
+	defaultPerReadDeadline = 60 * time.Second
 )
+
+const (
+	composeUpWait  = 5 * time.Minute
+	httpReqTimeout = 2 * time.Minute
+	pollInterval   = 50 * time.Millisecond
+)
+
+var (
+	numRequests     = envInt("BENCH_REQUESTS", defaultNumRequests)
+	payloadSize     = envInt("BENCH_PAYLOAD_SIZE", defaultPayloadSize)
+	perReadDeadline = envDuration("BENCH_PER_READ_TIMEOUT", defaultPerReadDeadline)
+)
+
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return def
+	}
+	return d
+}
 
 type stackCfg struct {
 	name     string
@@ -77,16 +128,51 @@ var stacks = []stackCfg{
 	},
 }
 
-// payloadFiller is the static 256 KiB body shared by every request:
-// allocated once and never mutated. Each /new body is built by writing
-// a 15-byte per-seq header into a reusable scratch buffer and then
-// appending the suffix of payloadFiller, so we don't burn 30000 * 256
-// KiB of GC churn.
+// payloadFiller is the static body shared by every request: allocated
+// once at package init and never mutated. Each /new body is built by
+// writing a 15-byte per-seq header into a reusable scratch buffer and
+// then appending the suffix of payloadFiller, so we don't burn one
+// allocation × payloadSize per request through GC.
 var payloadFiller = bytes.Repeat([]byte{'a'}, payloadSize)
 
 const payloadHeaderFmt = "SEQ=%010d:" // 15 bytes
-
 const payloadHeaderLen = 15
+
+// TestMain installs a signal handler that tears both compose stacks
+// down on SIGINT/SIGTERM. t.Cleanup hooks fire on test failures but
+// not on Ctrl+C or external SIGTERM, so without this a killed run
+// would leave containers and named volumes lying around.
+//
+// SIGKILL (kernel OOM, kill -9) still cannot be intercepted; if your
+// run gets force-killed, run
+//
+//	docker compose --project-name bench-blurry -f bench/docker-compose.blurry.yml down -v
+//	docker compose --project-name bench-chotki -f bench/docker-compose.chotki.yml down -v
+//
+// to clean up by hand.
+func TestMain(m *testing.M) {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		s := <-sigs
+		fmt.Fprintf(os.Stderr, "bench: got %s, tearing down compose stacks...\n", s)
+		teardownAllStacks()
+		os.Exit(130)
+	}()
+	os.Exit(m.Run())
+}
+
+func teardownAllStacks() {
+	for _, s := range stacks {
+		composePath, err := filepath.Abs(s.compose)
+		if err != nil {
+			continue
+		}
+		_, _ = runCmd(2*time.Minute,
+			"docker", "compose", "--project-name", s.project, "-f", composePath,
+			"down", "-v")
+	}
+}
 
 func TestBench(t *testing.T) {
 	if testing.Short() {
