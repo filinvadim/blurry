@@ -108,11 +108,9 @@ func runBench(t *testing.T, s stackCfg) {
 	}
 
 	t.Logf("[%s] bringing stack up via %s (project=%s)", s.name, composePath, s.project)
-	if out, err := runCmd(composeUpWait,
-		"docker", "compose", "--project-name", s.project, "-f", composePath,
-		"up", "-d", "--build", "--wait"); err != nil {
-		t.Fatalf("docker compose up: %v\n%s", err, out)
-	}
+	// Register the teardown before bringing the stack up so a failed
+	// `up` (which can leave partially-created networks/volumes/containers
+	// behind) still gets cleaned out.
 	t.Cleanup(func() {
 		out, derr := runCmd(2*time.Minute,
 			"docker", "compose", "--project-name", s.project, "-f", composePath,
@@ -121,6 +119,11 @@ func runBench(t *testing.T, s stackCfg) {
 			t.Logf("[%s] docker compose down: %v\n%s", s.name, derr, out)
 		}
 	})
+	if out, err := runCmd(composeUpWait,
+		"docker", "compose", "--project-name", s.project, "-f", composePath,
+		"up", "-d", "--build", "--wait"); err != nil {
+		t.Fatalf("docker compose up: %v\n%s", err, out)
+	}
 
 	if err := waitReady(s.writeURL, 2*time.Minute); err != nil {
 		t.Fatalf("[%s] write replica not ready: %v", s.name, err)
@@ -142,6 +145,11 @@ func runBench(t *testing.T, s stackCfg) {
 
 	ch := make(chan pair, 256)
 	writeErr := make(chan error, 1)
+	// done is closed when the reader gives up (verification failure or
+	// premature exit) so the writer goroutine can stop instead of
+	// blocking on `ch <- pair` against a torn-down stack.
+	done := make(chan struct{})
+	defer close(done)
 
 	start := time.Now()
 
@@ -149,26 +157,42 @@ func runBench(t *testing.T, s stackCfg) {
 		defer close(ch)
 		bodyBuf := bytes.NewBuffer(make([]byte, 0, payloadSize+128))
 		for seq := 0; seq < numRequests; seq++ {
+			select {
+			case <-done:
+				writeErr <- nil
+				return
+			default:
+			}
 			id, err := postNew(s.writeURL, classID, seq, bodyBuf)
 			if err != nil {
 				writeErr <- fmt.Errorf("write seq=%d: %w", seq, err)
 				return
 			}
-			ch <- pair{seq, id}
+			select {
+			case ch <- pair{seq, id}:
+			case <-done:
+				writeErr <- nil
+				return
+			}
 		}
 		writeErr <- nil
 	}()
 
 	read := 0
+	var verifyErr error
 	for p := range ch {
 		deadline := time.Now().Add(perReadDeadline)
 		if err := pollAndVerify(s.readURL, p.id, p.seq, deadline); err != nil {
-			t.Fatalf("[%s] read seq=%d id=%s: %v", s.name, p.seq, p.id, err)
+			verifyErr = fmt.Errorf("read seq=%d id=%s: %w", p.seq, p.id, err)
+			break
 		}
 		read++
 		if read%1000 == 0 {
 			t.Logf("[%s] verified %d/%d in %s", s.name, read, numRequests, time.Since(start))
 		}
+	}
+	if verifyErr != nil {
+		t.Fatalf("[%s] %v", s.name, verifyErr)
 	}
 	if err := <-writeErr; err != nil {
 		t.Fatalf("[%s] writer: %v", s.name, err)
@@ -191,15 +215,17 @@ func waitReady(base string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		resp, err := httpClient.Get(base + "/cat?id=ping")
-		if err == nil {
+		// http.Get can return a non-nil resp alongside a non-nil err
+		// (redirect failures, etc.) — drain & close in either case.
+		if resp != nil {
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
-			// Any non-5xx status means the HTTP server is up and
-			// answering; we tolerate 4xx because /cat?id=ping is
-			// an intentionally invalid request used as a probe.
-			if resp.StatusCode > 0 && resp.StatusCode < 500 {
-				return nil
-			}
+		}
+		// Any non-5xx status means the HTTP server is up and
+		// answering; we tolerate 4xx because /cat?id=ping is an
+		// intentionally invalid request used as a probe.
+		if err == nil && resp != nil && resp.StatusCode > 0 && resp.StatusCode < 500 {
+			return nil
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
@@ -256,18 +282,26 @@ func pollAndVerify(base, id string, seq int, deadline time.Time) error {
 	url := base + "/cat?id=" + id
 	for {
 		resp, err := httpClient.Get(url)
-		if err == nil {
-			bt, _ := io.ReadAll(resp.Body)
+		// http.Get can return a non-nil resp alongside a non-nil err
+		// (redirect failures, etc.) — read & close in either case so
+		// the keep-alive pool doesn't leak idle connections.
+		var (
+			body   []byte
+			status string
+		)
+		if resp != nil {
+			body, _ = io.ReadAll(resp.Body)
 			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				if verr := verifyResponse(bt, seq); verr != nil {
-					return verr
-				}
-				return nil
+			status = resp.Status
+		}
+		if err == nil && resp != nil && resp.StatusCode == http.StatusOK {
+			if verr := verifyResponse(body, seq); verr != nil {
+				return verr
 			}
+			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timeout waiting for sync; last status=%v err=%v", statusOf(resp), err)
+			return fmt.Errorf("timeout waiting for sync; last status=%q err=%v", status, err)
 		}
 		time.Sleep(pollInterval)
 	}
@@ -338,13 +372,6 @@ func extractField(body []byte, name string) ([]byte, error) {
 		return nil, fmt.Errorf("field %q has no terminator", name)
 	}
 	return val[:end], nil
-}
-
-func statusOf(r *http.Response) any {
-	if r == nil {
-		return nil
-	}
-	return r.Status
 }
 
 func runCmd(timeout time.Duration, name string, args ...string) ([]byte, error) {

@@ -5,18 +5,36 @@
 # binds its HTTP API to 127.0.0.1, so the entrypoint runs a small
 # socat forwarder to expose it on 0.0.0.0 inside the container.
 #
-# CHOTKI_REF pins the upstream chotki commit. Override only when you
-# explicitly want to test against a different revision.
+# Source is fetched via `git clone ${CHOTKI_REPO}` pinned to
+# ${CHOTKI_REF}. Both are overridable build args, so an environment
+# with restricted GitHub egress can point at an internal mirror:
+#
+#   docker build \
+#     --build-arg CHOTKI_REPO=git://internal.example.com/chotki.git \
+#     --build-arg CHOTKI_REF=<sha> \
+#     bench/chotki
+#
+# For a fully offline build, point CHOTKI_REPO at a path on disk
+# (`file:///path/to/local/clone`); git accepts file:// URLs and clones
+# without touching the network.
 ARG CHOTKI_REF=6a3944bc8b7f5135d4740976bad8946e59001b01
+ARG CHOTKI_REPO=https://github.com/drpcorg/chotki.git
+
+# ---- fetch ------------------------------------------------------------
+# Cloning happens in its own stage so the runtime image never sees the
+# .git directory or the git binary.
+FROM alpine:3.20 AS fetch
+RUN apk add --no-cache git ca-certificates
+ARG CHOTKI_REPO
+ARG CHOTKI_REF
+RUN git clone "${CHOTKI_REPO}" /chotki && \
+    git -C /chotki checkout "${CHOTKI_REF}" && \
+    rm -rf /chotki/.git
 
 # ---- build ------------------------------------------------------------
 FROM golang:1.25-alpine AS build
-
-RUN apk add --no-cache git ca-certificates
-
-ARG CHOTKI_REF
-RUN git clone https://github.com/drpcorg/chotki.git /chotki && \
-    git -C /chotki checkout "${CHOTKI_REF}"
+RUN apk add --no-cache ca-certificates
+COPY --from=fetch /chotki /chotki
 
 WORKDIR /chotki
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \

@@ -30,7 +30,15 @@ PEERS="${PEERS:-}"
 
 cd /data
 
-socat -d "TCP-LISTEN:${HTTP_PORT},fork,reuseaddr" \
+# socat itself is silent by default; debug logging is opt-in via
+# SOCAT_DEBUG=1 because per-connection chatter from 30k forwarded
+# requests can both flood logs and slow the bench.
+SOCAT_DEBUG_FLAG=""
+if [ -n "${SOCAT_DEBUG:-}" ]; then
+    SOCAT_DEBUG_FLAG="-d"
+fi
+# shellcheck disable=SC2086
+socat ${SOCAT_DEBUG_FLAG} "TCP-LISTEN:${HTTP_PORT},fork,reuseaddr" \
       "TCP:127.0.0.1:${INTERNAL_HTTP_PORT}" &
 
 # Pick `open` if there's already a chotki dir in /data, otherwise
