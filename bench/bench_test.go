@@ -422,8 +422,14 @@ func blurryWrite(ctx context.Context, base, _ string, seq int, payload []byte) (
 }
 
 func blurryRead(ctx context.Context, base, id string) ([]byte, error) {
+	// Pass the key verbatim — Fiber's "/v1/kv/*" wildcard matches over
+	// the raw URL path. url.PathEscape would percent-encode the "/"
+	// inside `id` to "%2F", which fasthttp keeps verbatim in the
+	// captured wildcard, producing "bench%2F0000000000" lookups that
+	// never match the stored "bench/0000000000". Our keys are
+	// alphanumeric + "/" so direct concatenation is safe.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		base+"/v1/kv/"+url.PathEscape(id), nil)
+		base+"/v1/kv/"+id, nil)
 	if err != nil {
 		return nil, err
 	}

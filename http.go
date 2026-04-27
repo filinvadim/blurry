@@ -67,10 +67,16 @@ func NewHTTPServer(b *Blurry) *HTTPServer {
 // Start binds and serves the API on addr (e.g. "127.0.0.1:8001"). If
 // Settings.TlsConfig has at least one certificate, the listener is
 // wrapped with tls.NewListener so the same code path covers HTTPS.
+//
+// Fiber's startup banner ("Fiber" ASCII art + listening address) is
+// suppressed — we already log a single "http: serving on …" line
+// and the banner adds 16 lines of noise to test output and
+// container logs.
 func (h *HTTPServer) Start(addr string) error {
 	h.listen = addr
 	tlsCfg := h.b.settings.TlsConfig
 	useTLS := tlsCfg != nil && len(tlsCfg.Certificates) > 0
+	listenCfg := fiber.ListenConfig{DisableStartupMessage: true}
 	go func() {
 		var err error
 		if useTLS {
@@ -79,9 +85,9 @@ func (h *HTTPServer) Start(addr string) error {
 				httpLog.Errorf("http: tls listen %s: %v", addr, lerr)
 				return
 			}
-			err = h.app.Listener(ln)
+			err = h.app.Listener(ln, listenCfg)
 		} else {
-			err = h.app.Listen(addr)
+			err = h.app.Listen(addr, listenCfg)
 		}
 		if err != nil && !errors.Is(err, fiber.ErrServiceUnavailable) {
 			httpLog.Errorf("http: serve %s: %v", addr, err)
