@@ -1,0 +1,149 @@
+# Three-replica Blurry cluster (bench harness).
+#
+# Build context is the parent directory (the Blurry repo root) so the
+# existing project Dockerfile is picked up unchanged.
+#
+# This compose strips the env block down to the settings Blurry's
+# runtime actually consumes. The chotki-parity timing/sizing knobs
+# (BroadcastQueue*, ReadAccum*, ReadMinBuffer*, TcpRead/Write,
+# PingPeriod, MaxSyncDuration, WriteTimeout) are dead weight for
+# Blurry — they are parsed and stored, but only the optional
+# chotki-bridge feature reads them, which the bench doesn't use.
+# libp2p public-internet features (DHT, relay, hole punching, NAT) are
+# also off because all three replicas are on a single Docker network
+# with explicit, deterministic peer addresses.
+#
+# Quick start (from the repo root):
+#   docker compose -f bench/docker-compose.blurry.yml up --build
+#   curl -X POST -d '{Name:S}' http://127.0.0.1:8001/class
+
+x-blurry-env: &blurry-env
+  # ---- identity / runtime --------------------------------------------
+  # BLURRY_NAME is the canonical identifier: peer id and chotki Src
+  # are derived from it. Two replicas with the same name are the same
+  # logical node.
+  BLURRY_DATA_DIR: /tmp/blurry
+  BLURRY_NAME: ""
+
+  # ---- libp2p endpoint -----------------------------------------------
+  BLURRY_LISTEN_HOST: 0.0.0.0
+  BLURRY_LISTEN_PORT: "4001"
+
+  # ---- HTTP API ------------------------------------------------------
+  BLURRY_HTTP_HOST: 0.0.0.0
+  BLURRY_HTTP_PORT: "8001"
+
+  # ---- cluster -------------------------------------------------------
+  # Comma-separated list of peers (host:port, bare IP, or multiaddr).
+  BLURRY_CLUSTER_PEERS: ""
+  BLURRY_PRIVATE_NETWORK_PSK: ""
+
+  # ---- libp2p toggles ------------------------------------------------
+  # All off: peers are explicit, the network is a Docker bridge, and
+  # the bench doesn't need DHT routing, relay paths, or NAT traversal.
+  BLURRY_ENABLE_DHT: "false"
+  BLURRY_ENABLE_RELAY: "false"
+  BLURRY_ENABLE_RELAY_SERVICE: "false"
+  BLURRY_ENABLE_HOLE_PUNCHING: "false"
+  BLURRY_ENABLE_NAT_SERVICE: "false"
+  BLURRY_ENABLE_NAT_PORT_MAP: "false"
+  BLURRY_ENABLE_AUTO_NATV2: "false"
+  BLURRY_ENABLE_AUTO_RELAY: "false"
+  BLURRY_ENABLE_METRICS: "false"
+
+  # ---- connection manager --------------------------------------------
+  BLURRY_CONN_LOW_WATER: "20"
+  BLURRY_CONN_HIGH_WATER: "50"
+  BLURRY_CONN_GRACE_PERIOD: 1h
+
+  # ---- CRDT (go-ds-crdt) ---------------------------------------------
+  BLURRY_VERSION_PREFIX: ""
+  BLURRY_REBROADCAST_INTERVAL: 30s
+  BLURRY_DAG_SYNCER_TIMEOUT: 5m
+
+  # ---- storage -------------------------------------------------------
+  BLURRY_SYNC_WRITES: "true"
+
+  # ---- TLS (paths inside the container; mount via volumes) -----------
+  BLURRY_TLS_CERT_FILE: ""
+  BLURRY_TLS_KEY_FILE: ""
+
+services:
+  # Only blurry-1 declares `build:`. blurry-2/3 reference the already-built
+  # image: declaring `build:` on every service makes `docker compose up
+  # --build` race three concurrent builders against the same image tag,
+  # and one of them eventually fails with "image: already exists" during
+  # export.
+  blurry-1:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: blurry:local
+    container_name: blurry-1
+    environment:
+      <<: *blurry-env
+      BLURRY_NAME: blurry-1
+      BLURRY_HTTP_PORT: "8001"
+      BLURRY_LISTEN_PORT: "4001"
+      # Multiaddrs include the deterministic peer id derived from the
+      # peer's BLURRY_NAME (sha256(Name) seeds the Ed25519 key). When
+      # you change a peer's name, regenerate these via:
+      #   go run ./cmd/peerid blurry-1 blurry-2 blurry-3
+      BLURRY_CLUSTER_PEERS: >-
+        /dns/blurry-2/tcp/4002/p2p/12D3KooWQCKz5MbpG45o2QvNtisXCNyrZx3oHyFNagCeHbrmiJCx,/dns/blurry-3/tcp/4003/p2p/12D3KooWDU8kKajZeSsdRtdfcj4AYASVMd3LhRECvggZ5UbmzsRZ
+    ports:
+      - "4001:4001"
+      - "8001:8001"
+    volumes:
+      - blurry-1-data:/tmp/blurry
+    networks:
+      - blurry
+
+  blurry-2:
+    image: blurry:local
+    container_name: blurry-2
+    depends_on:
+      - blurry-1
+    environment:
+      <<: *blurry-env
+      BLURRY_NAME: blurry-2
+      BLURRY_HTTP_PORT: "8002"
+      BLURRY_LISTEN_PORT: "4002"
+      BLURRY_CLUSTER_PEERS: >-
+        /dns/blurry-1/tcp/4001/p2p/12D3KooWFFGFkKFVEBXd6AVRbXPr93PhKQupxxDSjDZYgjTTTh3k,/dns/blurry-3/tcp/4003/p2p/12D3KooWDU8kKajZeSsdRtdfcj4AYASVMd3LhRECvggZ5UbmzsRZ
+    ports:
+      - "4002:4002"
+      - "8002:8002"
+    volumes:
+      - blurry-2-data:/tmp/blurry
+    networks:
+      - blurry
+
+  blurry-3:
+    image: blurry:local
+    container_name: blurry-3
+    depends_on:
+      - blurry-1
+    environment:
+      <<: *blurry-env
+      BLURRY_NAME: blurry-3
+      BLURRY_HTTP_PORT: "8003"
+      BLURRY_LISTEN_PORT: "4003"
+      BLURRY_CLUSTER_PEERS: >-
+        /dns/blurry-1/tcp/4001/p2p/12D3KooWFFGFkKFVEBXd6AVRbXPr93PhKQupxxDSjDZYgjTTTh3k,/dns/blurry-2/tcp/4002/p2p/12D3KooWQCKz5MbpG45o2QvNtisXCNyrZx3oHyFNagCeHbrmiJCx
+    ports:
+      - "4003:4003"
+      - "8003:8003"
+    volumes:
+      - blurry-3-data:/tmp/blurry
+    networks:
+      - blurry
+
+networks:
+  blurry:
+    driver: bridge
+
+volumes:
+  blurry-1-data:
+  blurry-2-data:
+  blurry-3-data:

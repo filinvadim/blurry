@@ -1,0 +1,91 @@
+# Three-replica Chotki cluster (bench harness).
+#
+# Each container runs the official chotki repl binary built from the
+# upstream drpcorg/chotki repository (see ./chotki/Dockerfile). No
+# bench-side wrapper sits between the test and chotki; the test talks
+# directly to the repl's HTTP handlers (POST /class, POST /new, GET
+# /cat). socat forwards 0.0.0.0:$HTTP_PORT to chotki's localhost-only
+# servehttp inside the container so it is reachable from outside.
+#
+# Replicas form a spanning tree (chotki only allows connecting to
+# lesser src numbers): chotki-3 -> chotki-2 -> chotki-1.
+#
+# Quick start (from the repo root):
+#   docker compose -f bench/docker-compose.chotki.yml up --build
+
+x-chotki-build: &chotki-build
+  build:
+    context: ./chotki
+  image: chotki-bench:local
+
+x-chotki-base: &chotki-base
+  image: chotki-bench:local
+  tty: true
+  stdin_open: true
+  networks:
+    - chotki
+
+services:
+  # Only chotki-1 declares `build:`. chotki-2 and chotki-3 reference the
+  # already-built image: declaring `build:` on every service makes
+  # `docker compose up --build` race three concurrent builders against
+  # the same image tag, and one of them eventually fails with
+  # "image: already exists" during export.
+  chotki-1:
+    <<: *chotki-build
+    tty: true
+    stdin_open: true
+    networks:
+      - chotki
+    environment:
+      SRC: "1"
+      LISTEN_ADDR: 0.0.0.0:4001
+      HTTP_PORT: "8001"
+      INTERNAL_HTTP_PORT: "18001"
+      PEERS: ""
+    ports:
+      - "9001:8001"
+      - "14001:4001"
+    volumes:
+      - chotki-1-data:/data
+
+  chotki-2:
+    <<: *chotki-base
+    environment:
+      SRC: "2"
+      LISTEN_ADDR: 0.0.0.0:4001
+      HTTP_PORT: "8001"
+      INTERNAL_HTTP_PORT: "18001"
+      PEERS: chotki-1:4001
+    ports:
+      - "9002:8001"
+      - "14002:4001"
+    volumes:
+      - chotki-2-data:/data
+    depends_on:
+      - chotki-1
+
+  chotki-3:
+    <<: *chotki-base
+    environment:
+      SRC: "3"
+      LISTEN_ADDR: 0.0.0.0:4001
+      HTTP_PORT: "8001"
+      INTERNAL_HTTP_PORT: "18001"
+      PEERS: chotki-2:4001
+    ports:
+      - "9003:8001"
+      - "14003:4001"
+    volumes:
+      - chotki-3-data:/data
+    depends_on:
+      - chotki-2
+
+networks:
+  chotki:
+    driver: bridge
+
+volumes:
+  chotki-1-data:
+  chotki-2-data:
+  chotki-3-data:
